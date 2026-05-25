@@ -1,0 +1,1 @@
+/usr/bin/g++ -g CMakeFiles/test_task.dir/test_task.cc.o -o test_task  -Wl,-rpath,/home/ilin/project/Mprpc/coro_net/build ../libcoro_net.so -luring -lpthread 

@@ -1,0 +1,2 @@
+add_executable(echo_server_coro echo_server.cc)
+target_link_libraries(echo_server_coro PRIVATE coro_net)

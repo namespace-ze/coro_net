@@ -1,0 +1,1 @@
+/usr/bin/g++ -fPIC -g -shared -Wl,-soname,libcoro_net.so -o libcoro_net.so CMakeFiles/coro_net.dir/src/coroutine/io_operation.cc.o CMakeFiles/coro_net.dir/src/net/tcp.cc.o CMakeFiles/coro_net.dir/src/scheduler/scheduler.cc.o CMakeFiles/coro_net.dir/src/thread_pool/coro_thread_pool.cc.o  -luring -lpthread 
