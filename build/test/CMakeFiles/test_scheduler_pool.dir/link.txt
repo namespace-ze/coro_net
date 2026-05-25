@@ -1,1 +1,0 @@
-/usr/bin/g++ -g CMakeFiles/test_scheduler_pool.dir/test_scheduler_pool.cc.o -o test_scheduler_pool  -Wl,-rpath,/home/ilin/project/Mprpc/coro_net/build ../libcoro_net.so -luring -lpthread 

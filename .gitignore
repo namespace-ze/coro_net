@@ -1,0 +1,54 @@
+# Build outputs
+build/
+out/
+cmake-build-*/
+lib/
+bin/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+_deps/
+compile_commands.json
+install_manifest.txt
+
+# Compiled object / binary
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# Compiler / linker intermediates
+*.d
+*.gch
+*.pch
+
+# IDE / editor
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.cache/
+.clangd/
+
+# Logs / coverage
+*.log
+*.gcda
+*.gcno
+*.gcov
+core
+core.*
