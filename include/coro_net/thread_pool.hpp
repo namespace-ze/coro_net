@@ -64,11 +64,10 @@
 
 #include "coro_net/task.hpp"
 #include "coro_net/scheduler.hpp"
+#include "coro_net/submit_awaiter.hpp"
 
 #include <atomic>
 #include <condition_variable>
-#include <coroutine>
-#include <exception>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -76,7 +75,6 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace coro_net {
@@ -129,67 +127,29 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// SubmitAwaiter —— pool.submit 返回的类型
+// SubmitAwaiter::await_suspend —— 定义放在这里以便看到 CoroThreadPool::enqueue
 // -----------------------------------------------------------------------------
 template <typename R, typename F>
-class SubmitAwaiter {
-public:
-    SubmitAwaiter(CoroThreadPool* pool, F fn)
-        : pool_(pool), fn_(std::move(fn)) {}
-
-    SubmitAwaiter(const SubmitAwaiter&) = delete;
-    SubmitAwaiter& operator=(const SubmitAwaiter&) = delete;
-    // 允许 move：临时对象需要被 co_await 表达式接管
-    SubmitAwaiter(SubmitAwaiter&&) = default;
-
-    bool await_ready() const noexcept { return false; }
-
-    // -------------------------------------------------------------------------
-    // await_suspend
-    // -------------------------------------------------------------------------
-    // 1) 记下"我在哪个 Scheduler 上挂起"——业务线程结束后要把 handle 送回这里
-    // 2) 把"运行 fn 并通知"打包成 std::function<void()> 推到 pool 队列
-    // 3) 返回（控制权交回 Scheduler，本协程已挂起）
-    // -------------------------------------------------------------------------
-    void await_suspend(std::coroutine_handle<> h) noexcept {
-        handle_ = h;
-        src_sched_ = Scheduler::current();
-        // 把"运行 + 写结果 + 唤醒"作为一个 lambda 投递
-        pool_->enqueue([this]() {
-            try {
-                if constexpr (std::is_void_v<R>) {
-                    fn_();
-                    result_.template emplace<1>(std::monostate{});
-                } else {
-                    result_.template emplace<1>(fn_());
-                }
-            } catch (...) {
-                result_.template emplace<2>(std::current_exception());
+inline void SubmitAwaiter<R, F>::await_suspend(std::coroutine_handle<> h) noexcept {
+    handle_ = h;
+    src_sched_ = Scheduler::current();
+    // 把"运行 + 写结果 + 唤醒"作为一个 lambda 投递
+    pool_->enqueue([this]() {
+        try {
+            if constexpr (std::is_void_v<R>) {
+                fn_();
+                result_.template emplace<1>(std::monostate{});
+            } else {
+                result_.template emplace<1>(fn_());
             }
-            // 业务线程完成 → 通过 eventfd 兜底路径让 src_sched 唤醒
-            // 并把 handle 送回 ready 队列（drain_cross_queue 完成）
-            src_sched_->post(handle_);
-        });
-    }
-
-    R await_resume() {
-        if (result_.index() == 2) {
-            std::rethrow_exception(std::get<2>(result_));
+        } catch (...) {
+            result_.template emplace<2>(std::current_exception());
         }
-        if constexpr (!std::is_void_v<R>) {
-            return std::move(std::get<1>(result_));
-        }
-    }
-
-private:
-    // result_ index: 0=未完成, 1=值/void, 2=异常
-    using Slot = std::conditional_t<std::is_void_v<R>, std::monostate, R>;
-    std::variant<std::monostate, Slot, std::exception_ptr> result_;
-    CoroThreadPool* pool_;
-    F fn_;
-    std::coroutine_handle<> handle_{};
-    Scheduler* src_sched_ = nullptr;
-};
+        // 业务线程完成 → 通过 eventfd 兜底路径让 src_sched 唤醒
+        // 并把 handle 送回 ready 队列（drain_cross_queue 完成）
+        src_sched_->post(handle_);
+    });
+}
 
 template <typename F>
 auto CoroThreadPool::submit(F&& fn) {

@@ -6,7 +6,7 @@
 //
 //   每个 IO worker 线程持有一个 Scheduler 实例。Scheduler 是这个线程的"大脑"：
 //     - 拥有一个 io_uring 实例（SQ/CQ 不与其他线程共享，完全无锁）
-//     - 拥有一个 BufferRing 池（provide-buffers 入口）
+//     - 拥有一个 TimerQueue（per-worker 计时器堆）
 //     - 拥有一个 ready 队列：当前可立即 resume 的协程
 //     - 跑事件循环 run()：交替处理 ready 队列与 CQE
 //
@@ -71,7 +71,10 @@
 #pragma once
 
 #include "coro_net/task.hpp"
+#include "coro_net/fire_and_forget.hpp"
+#include "coro_net/timer/timer_id.hpp"
 #include <coroutine>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -79,21 +82,18 @@
 #include <atomic>
 #include <functional>
 #include <vector>
-#include <thread>
 
 namespace coro_net {
 
 class IoUring;
-class BufferRing;
+class TimerQueue;
 
 // -----------------------------------------------------------------------------
 // SchedulerConfig：构造 Scheduler 时的参数
 // -----------------------------------------------------------------------------
+// BufferRing 已废除（io_uring 直接写 per-conn Buffer），不再有 buf_ring_* 配置。
 struct SchedulerConfig {
     unsigned ring_entries = 1024;       // SQ/CQ 容量
-    uint16_t buf_ring_bgid = 1;          // 默认 buffer group id
-    uint16_t buf_ring_entries = 1024;    // buffer 数量
-    uint32_t buf_ring_buf_size = 4096;   // 每个 buffer 字节数
 };
 
 class Scheduler {
@@ -167,7 +167,13 @@ public:
     }
 
     IoUring& ring() noexcept { return *ring_; }
-    BufferRing& buffer_ring() noexcept { return *brg_; }
+    TimerQueue& timer_queue() noexcept { return *timer_queue_; }
+
+    // Timer 便捷接口（详见 timer/timer_queue.hpp）；同线程返回有效 TimerId，
+    // 跨线程会 post_task bounce 但返回空 TimerId。
+    TimerId run_after(std::chrono::nanoseconds delay, std::function<void()> fn);
+    TimerId run_every(std::chrono::nanoseconds interval, std::function<void()> fn);
+    void cancel(TimerId id);
 
     // thread_local current 指针：让 awaiter 不需要显式拿到 Scheduler 也能找到自己
     static Scheduler* current() noexcept { return tls_current_; }
@@ -180,7 +186,7 @@ private:
     static thread_local Scheduler* tls_current_;
 
     std::unique_ptr<IoUring> ring_;
-    std::unique_ptr<BufferRing> brg_;
+    std::unique_ptr<TimerQueue> timer_queue_;
     std::deque<std::coroutine_handle<>> ready_;
     std::atomic_bool stopping_{false};
 
@@ -199,45 +205,6 @@ private:
     std::unique_ptr<EventfdWatcher> wake_watcher_;
 };
 
-// =============================================================================
-// SchedulerPool —— 管理 N 个 Scheduler（每个独占一个线程）
-// =============================================================================
-//
-// 【用途】TcpServer 启动时构造一个 SchedulerPool，每个 worker 线程跑一个
-//        Scheduler::run()。新连接到来时 round-robin 选下一个 worker。
-//
-// 【接口】
-//   - start()：拉起 N 个线程，每个跑一个 Scheduler::run()
-//   - stop_all()：让所有 Scheduler 退出循环
-//   - wait()：join 所有线程
-//   - next()：round-robin 选下一个 Scheduler 引用
-//   - at(i)：拿到第 i 个 Scheduler 引用
-//
-// 【生命周期】
-//   构造时 *仅* 创建 Scheduler 对象（在主线程的栈上构造，未运行）；
-//   start() 拉起线程；析构前必须 stop_all + wait。
-// =============================================================================
-class SchedulerPool {
-public:
-    explicit SchedulerPool(size_t n);
-    ~SchedulerPool();
-
-    SchedulerPool(const SchedulerPool&) = delete;
-    SchedulerPool& operator=(const SchedulerPool&) = delete;
-
-    void start();
-    void stop_all();
-    void wait();
-
-    size_t size() const noexcept { return schedulers_.size(); }
-    Scheduler& at(size_t i) noexcept { return *schedulers_[i]; }
-    Scheduler& next() noexcept;
-
-private:
-    std::vector<std::unique_ptr<Scheduler>> schedulers_;
-    std::vector<std::thread> threads_;
-    std::atomic<size_t> next_idx_{0};
-    bool started_ = false;
-};
-
 }  // namespace coro_net
+
+// SchedulerPool 已拆分至 coro_net/scheduler_pool.hpp。

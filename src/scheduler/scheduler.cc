@@ -1,10 +1,15 @@
 // =============================================================================
-// scheduler.cc — Scheduler 事件循环 + SchedulerPool 实现
+// scheduler.cc — Scheduler 事件循环实现
+// =============================================================================
+// SchedulerPool 拆出到 scheduler_pool.cc。
+// EventfdWatcher 是 Scheduler 的私有嵌套类，留在本文件。
 // =============================================================================
 #include "coro_net/scheduler.hpp"
 #include "coro_net/io_operation.hpp"
 #include "coro_net/io/io_uring.h"
-#include "coro_net/io/buffer_ring.h"
+#include "coro_net/log.hpp"
+#include "coro_net/timer/timer_id.hpp"
+#include "coro_net/timer/timer_queue.hpp"
 
 // EventfdWatcher 定义放到 .cc 里（私有实现）
 
@@ -13,7 +18,6 @@
 #include <system_error>
 #include <utility>
 #include <cstring>
-#include <cstdio>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
@@ -58,21 +62,19 @@ private:
 };
 
 // -----------------------------------------------------------------------------
-// 构造：建 ring + buffer ring
+// 构造：建 ring + eventfd watcher + TimerQueue
 // -----------------------------------------------------------------------------
 Scheduler::Scheduler(SchedulerConfig cfg) {
     ring_ = std::make_unique<IoUring>(cfg.ring_entries);
-    brg_ = std::make_unique<BufferRing>(ring_->raw(),
-                                        cfg.buf_ring_bgid,
-                                        cfg.buf_ring_entries,
-                                        cfg.buf_ring_buf_size);
-    // eventfd：用于无 ring 线程唤醒。EFD_NONBLOCK 让 read 不阻塞；
+    // eventfd：用于跨线程唤醒。EFD_NONBLOCK 让 read 不阻塞；
     // 读到 0 也无所谓——我们用 io_uring 异步读，syscall 行为在这里不重要。
     wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     wake_watcher_ = std::make_unique<EventfdWatcher>(*this, wake_fd_);
+    timer_queue_ = std::make_unique<TimerQueue>(*this);
 }
 
 Scheduler::~Scheduler() {
+    timer_queue_.reset();   // 先关 timerfd（释放它在 ring 上挂的 read）
     if (wake_fd_ >= 0) ::close(wake_fd_);
 }
 
@@ -111,56 +113,17 @@ void Scheduler::drain_cross_queue() {
 }
 
 // -----------------------------------------------------------------------------
-// wake_remote —— 从当前线程的 ring 发一个 NOP MSG_RING 到目标 ring 上
+// wake_remote —— 用 eventfd 唤醒目标 Scheduler（统一路径）
 // -----------------------------------------------------------------------------
-//
-// 【为什么需要这一步】
-//   假设目标 Scheduler 正阻塞在 submit_and_wait(1) 里，cross_.queue 多了一项
-//   它也感知不到。所以我们需要在目标 ring 上"种"一个 CQE 让 wait 返回。
-//
-// 【MSG_RING 工作模型】
-//
-//   thread A (src)                                     thread B (target)
-//   --------------                                     -----------------
-//   io_uring_prep_msg_ring(sqe, B_ring_fd, 0, 0, 0)
-//   submit                                             正阻塞在 submit_and_wait
-//        |                                                      |
-//        +--→ 内核：把一个 CQE 推到 B 的 CQ                       |
-//        |    (res=0, user_data=0)                              |
-//        |                                              ←--- 醒来
-//        |                                              处理 CQE：user_data=0 跳过
-//        +--→ 给 A 的 CQ 推一个 CQE 表示 MSG_RING 提交完成        |
-//                                                       drain_cross_queue 取消息
-//
-//   data 字段我们填 0（不真正传递任何数据），跨线程"内容"通过 cross_.handles /
-//   cross_.tasks 队列传递。MSG_RING 只是"敲门"。
-//
-// 【调用者必须满足】
-//   - tls_current_ != this（不是本线程自己 post 自己）
-//   - tls_current_ != nullptr（调用线程有自己的 ring；若没有 ring，
-//     这是 S6 阶段 CoroThreadPool 才会遇到的场景，本函数当前不处理）
+// 历史上分两条：本线程是另一个 Scheduler 则走 MSG_RING；无 ring 则走 eventfd。
+// 现统一为 eventfd：路径单一、CQE 处理少一种特殊分支，与 shared-nothing
+// per-worker 模型更一致。代价：每次唤醒多一次 write(eventfd, 8B) syscall。
 // -----------------------------------------------------------------------------
 void Scheduler::wake_remote() {
-    Scheduler* src = tls_current_;
-    if (src == this) return;
-
-    if (src) {
-        // 调用线程是另一个 Scheduler → 用 MSG_RING（无锁、零内存拷贝）
-        io_uring_sqe* sqe = src->ring().get_sqe();
-        if (!sqe) {
-            src->ring().submit();
-            sqe = src->ring().get_sqe();
-            if (!sqe) return;
-        }
-        io_uring_prep_msg_ring(sqe, ring_->ring_fd(), 0, 0, 0);
-        io_uring_sqe_set_data(sqe, nullptr);  // 源端 CQE 忽略
-        src->ring().submit();
-    } else {
-        // 调用线程没有 ring（main 线程 / 业务线程）→ 走 eventfd 兜底
-        uint64_t v = 1;
-        ssize_t r = ::write(wake_fd_, &v, sizeof(v));
-        (void)r;  // EAGAIN 也无所谓：之前的写还没被消费就足以唤醒
-    }
+    if (tls_current_ == this) return;
+    uint64_t v = 1;
+    ssize_t r = ::write(wake_fd_, &v, sizeof(v));
+    (void)r;  // eventfd 不会丢消息（counter 累加语义），EAGAIN 也无所谓
 }
 
 // -----------------------------------------------------------------------------
@@ -204,9 +167,12 @@ void Scheduler::queue_boot_task(std::function<void()> f) {
 void Scheduler::run() {
     tls_current_ = this;
     stopping_.store(false, std::memory_order_relaxed);
+    LOG_INFO << "Scheduler@" << static_cast<const void*>(this) << " entering run()";
 
     // 挂一个永久 read 在 wake_fd 上，作为唤醒入口
     rearm_eventfd_watch();
+    // TimerQueue 在本线程挂上自己的 timerfd 读
+    timer_queue_->start();
 
     while (!stopping_.load(std::memory_order_relaxed)) {
         // 1) 先吃掉跨线程投来的消息（handles 进 ready_、tasks 立刻跑）
@@ -224,9 +190,9 @@ void Scheduler::run() {
         // 3) 提交 + 阻塞等至少 1 个 CQE
         int r = ring_->submit_and_wait(1);
         if (r < 0 && r != -EINTR) {
-            std::fprintf(stderr,
-                "[Scheduler %p] submit_and_wait returned %d (errno-meaning: %s)\n",
-                (void*)this, r, std::strerror(-r));
+            LOG_ERROR << "Scheduler@" << static_cast<const void*>(this)
+                      << " submit_and_wait returned " << r
+                      << " (errno=" << -r << ": " << std::strerror(-r) << ")";
             throw std::system_error(-r, std::system_category(),
                                     "io_uring submit_and_wait failed");
         }
@@ -240,11 +206,7 @@ void Scheduler::run() {
             io_uring_cqe* cqe = cqes[i];
             void* data = io_uring_cqe_get_data(cqe);
 
-            // user_data 为 nullptr：典型来源
-            //   (a) stop() 发的 NOP 唤醒
-            //   (b) wake_remote 提交 MSG_RING 后 src ring 的 CQE
-            //   (c) wake_remote 落到 target ring 的 CQE（data 我们填的 0）
-            // 一律跳过。
+            // user_data 为 nullptr：stop() 发的 NOP 唤醒 → 跳过
             if (!data) continue;
 
             auto* op = static_cast<IoOperationBase*>(data);
@@ -253,7 +215,40 @@ void Scheduler::run() {
         ring_->cq_advance(n);
     }
 
+    LOG_INFO << "Scheduler@" << static_cast<const void*>(this) << " exiting run()";
     tls_current_ = nullptr;
+}
+
+// -----------------------------------------------------------------------------
+// Timer 便捷接口 —— 详见 timer_queue.hpp
+// -----------------------------------------------------------------------------
+TimerId Scheduler::run_after(std::chrono::nanoseconds delay, std::function<void()> fn) {
+    if (tls_current_ == this) {
+        return timer_queue_->add(std::move(fn), delay);
+    }
+    // 跨线程：bounce 到本 worker 添加；调用方拿不到 id
+    post_task([this, fn = std::move(fn), delay]() mutable {
+        timer_queue_->add(std::move(fn), delay);
+    });
+    return TimerId{};
+}
+
+TimerId Scheduler::run_every(std::chrono::nanoseconds interval, std::function<void()> fn) {
+    if (tls_current_ == this) {
+        return timer_queue_->add_periodic(std::move(fn), interval);
+    }
+    post_task([this, fn = std::move(fn), interval]() mutable {
+        timer_queue_->add_periodic(std::move(fn), interval);
+    });
+    return TimerId{};
+}
+
+void Scheduler::cancel(TimerId id) {
+    if (tls_current_ == this) {
+        timer_queue_->cancel(id);
+        return;
+    }
+    post_task([this, id]() { timer_queue_->cancel(id); });
 }
 
 // -----------------------------------------------------------------------------
@@ -272,13 +267,8 @@ void Scheduler::stop() {
             ring_->submit();
         }
     } else {
-        // 跨线程：用 MSG_RING 唤醒；wake_remote 期望 src 有 ring
-        if (tls_current_) {
-            wake_remote();
-        }
-        // 如果调用方完全没有 ring（如 main thread），目标 worker 可能仍卡在 wait。
-        // S6 阶段补 eventfd 兜底；S4 阶段 TcpServer 内部会在合适的"有 ring"
-        // 上下文调用 stop。
+        // 跨线程：统一走 eventfd 唤醒
+        wake_remote();
     }
 }
 
@@ -294,71 +284,6 @@ FireAndForget spawn_shim(Task<void> t) {
 
 void Scheduler::spawn(Task<void> task) {
     spawn_shim(std::move(task));
-}
-
-// =============================================================================
-// SchedulerPool 实现
-// =============================================================================
-
-SchedulerPool::SchedulerPool(size_t n) {
-    schedulers_.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        schedulers_.emplace_back(std::make_unique<Scheduler>());
-    }
-}
-
-SchedulerPool::~SchedulerPool() {
-    if (started_) {
-        stop_all();
-        wait();
-    }
-}
-
-void SchedulerPool::start() {
-    started_ = true;
-    threads_.reserve(schedulers_.size());
-    for (auto& sch : schedulers_) {
-        Scheduler* p = sch.get();
-        threads_.emplace_back([p] { p->run(); });
-    }
-}
-
-void SchedulerPool::stop_all() {
-    // 注意：本函数通常在主线程（没有 ring 的线程）调用。
-    // Scheduler::stop 在跨线程 + 无 ring 情况下不能唤醒目标。
-    // 解决：我们让每个 worker 自己定期检查 stopping_ —— 不行，那需要 timeout。
-    // 简化做法：要求 stop_all 在某个 scheduler 线程上调用（如把它包成
-    // 一个发给 worker[0] 的 task）。
-    //
-    // 但更常见的用法是主线程 join 等结束，我们这里做一个权宜：
-    // 在每个 scheduler 自己 ring 上 *用一个 MSG_RING SQE 从我们这条线程* —
-    // 但我们没 ring 啊...
-    //
-    // 解决方案：每个 worker 在自己线程内监听一个"stop 信号"。最简单的实现：
-    // 在每个 scheduler 上 spawn 一个监听 stop 的协程。但这又要协程。
-    //
-    // 为 S4 简化：要求调用方先把所有 worker 都引导到一个 "drain → stop" 协程
-    // （由用户代码控制何时停）。stop_all() 直接设标志，依赖
-    // worker 自己 spawn 的协程会在适当时机调用本 scheduler 的 stop()。
-    //
-    // 这里只设置每个 scheduler 的 stopping_ 标志；MSG_RING 唤醒在 S6/兜底里做。
-    for (auto& sch : schedulers_) {
-        sch->stop();   // 同进程内 stop()，跨线程时只设标志，依赖现有 CQE 唤醒
-    }
-}
-
-void SchedulerPool::wait() {
-    for (auto& t : threads_) {
-        if (t.joinable()) t.join();
-    }
-    threads_.clear();
-    started_ = false;
-}
-
-Scheduler& SchedulerPool::next() noexcept {
-    size_t idx = next_idx_.fetch_add(1, std::memory_order_relaxed) %
-                 schedulers_.size();
-    return *schedulers_[idx];
 }
 
 }  // namespace coro_net

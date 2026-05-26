@@ -8,9 +8,10 @@
 // =============================================================================
 
 #include "coro_net/tcp.hpp"
+#include "coro_net/log.hpp"
 
+#include <chrono>
 #include <csignal>
-#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -24,7 +25,8 @@ int main(int argc, char** argv) {
     uint16_t port = (argc > 1) ? static_cast<uint16_t>(std::stoi(argv[1])) : 8002;
     int      nthr = (argc > 2) ? std::stoi(argv[2]) : 4;
 
-    std::printf("[echo_server_coro] listen :%u (workers=%d)\n", port, nthr);
+    coro_net::init_logger("echo_server_coro");
+    LOG_INFO << "listen :" << port << " workers=" << nthr;
 
     coro_net::TcpServer server(
         coro_net::InetAddress{port, "0.0.0.0"},
@@ -49,7 +51,14 @@ int main(int argc, char** argv) {
     std::signal(SIGTERM, on_signal);
 
     server.start();
+
+    // 心跳：每 5 秒在 worker[0] 上打一行（演示 Timer）
+    server.pool().at(0).run_every(std::chrono::seconds(5), [] {
+        LOG_INFO << "heartbeat";
+    });
+
     server.wait();
-    std::printf("[echo_server_coro] exited\n");
+    LOG_INFO << "exited";
+    coro_net::shutdown_logger();
     return 0;
 }

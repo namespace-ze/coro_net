@@ -1,10 +1,12 @@
 # =============================================================================
 # coro_net 库的 CMake 构建文件
 # =============================================================================
-# 这个库是 C++20 协程 + io_uring 异步网络库，独立于 mymuduo。
+# 这个库是 C++20 协程 + io_uring 异步网络库。
 # 依赖：
-#   - 编译器：g++ 13+ / clang 17+（需要 C++20 协程完整支持）
+#   - 编译器：g++ 13+ 或 clang 14+
 #   - liburing：sudo apt install liburing-dev
+#   - 用 clang 时还需 libc++（避开 clang 14 + libstdc++ 13 的 <chrono> consteval bug）：
+#       sudo apt install libc++-14-dev libc++abi-14-dev
 # 输出：libcoro_net.so 放到顶层 lib/ 目录
 # =============================================================================
 
@@ -62,8 +64,22 @@ target_link_libraries(coro_net
 
 target_compile_options(coro_net PRIVATE
     -Wall -Wextra -Wno-unused-parameter
-    -fcoroutines  # gcc 显式开启协程支持（gcc 13 默认已开，加上保险）
 )
+
+# -----------------------------------------------------------------------------
+# 编译器特定 flag
+# -----------------------------------------------------------------------------
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # -fcoroutines 是 GCC 专属（gcc 13 默认已开，加上保险）
+    target_compile_options(coro_net PRIVATE -fcoroutines)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    # Clang 14 + libstdc++ 13 的 <chrono> 有 consteval bug，
+    # 切到 libc++（需先 apt install libc++-XX-dev libc++abi-XX-dev）。
+    # PUBLIC 传递给依赖此库的 example / test，保持 ABI 一致。
+    target_compile_options(coro_net PUBLIC -stdlib=libc++)
+    target_link_options(coro_net PUBLIC -stdlib=libc++)
+    target_link_libraries(coro_net PUBLIC c++abi)
+endif()
 
 # -----------------------------------------------------------------------------
 # 子项目（example / test 在 S3 之后才有实际内容）

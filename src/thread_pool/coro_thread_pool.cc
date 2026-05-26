@@ -2,8 +2,7 @@
 // thread_pool/coro_thread_pool.cc —— CoroThreadPool 实现
 // =============================================================================
 #include "coro_net/thread_pool.hpp"
-
-#include <cstdio>
+#include "coro_net/log.hpp"
 
 namespace coro_net {
 
@@ -60,11 +59,9 @@ void CoroThreadPool::worker_loop() {
         try {
             task();
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "[%s] worker uncaught: %s\n",
-                         name_.c_str(), e.what());
+            LOG_ERROR << "[" << name_ << "] worker uncaught: " << e.what();
         } catch (...) {
-            std::fprintf(stderr, "[%s] worker uncaught: unknown\n",
-                         name_.c_str());
+            LOG_ERROR << "[" << name_ << "] worker uncaught: unknown";
         }
     }
 }

@@ -1,6 +1,7 @@
 // =============================================================================
-// coro_net/task.hpp — 协程返回类型 Task<T> 与 FireAndForget
+// coro_net/task.hpp — 协程返回类型 Task<T>
 // =============================================================================
+// FireAndForget 已拆分至 coro_net/fire_and_forget.hpp。
 //
 // 【背景知识：C++20 协程三大关键字】
 //   - co_await expr  ：挂起当前协程，等待 expr（必须是 Awaitable）；恢复后取值
@@ -321,37 +322,5 @@ inline Task<T> TaskPromise<T>::get_return_object() noexcept {
 inline Task<void> TaskPromise<void>::get_return_object() noexcept {
     return Task<void>{std::coroutine_handle<TaskPromise<void>>::from_promise(*this)};
 }
-
-// =============================================================================
-// FireAndForget —— 顶层"扔出去就不管"的协程入口
-// =============================================================================
-//
-// 【用途】Scheduler 启动一个 handler 协程，handler 跑完自动销毁帧，
-//        没有人 await 它的结果。例如：
-//          scheduler.spawn([&]() -> FireAndForget {
-//              co_await handle_connection(conn);
-//          }());
-//
-// 【与 Task 的区别】
-//    Task: lazy，必须有人 co_await 才会跑；结束后由所有者销毁
-//    FireAndForget: eager，立刻执行；结束后自己销毁帧
-// =============================================================================
-struct FireAndForget {
-    struct promise_type {
-        FireAndForget get_return_object() noexcept { return {}; }
-        // 立刻执行：initial 不挂起
-        std::suspend_never initial_suspend() noexcept { return {}; }
-        // 跑完自动销毁帧：final 不挂起 → 控制权回到 resume 调用者，
-        //               协程帧被编译器生成的代码自动 delete
-        std::suspend_never final_suspend() noexcept { return {}; }
-        void return_void() noexcept {}
-        void unhandled_exception() noexcept {
-            // FireAndForget 顶层捕获异常，没人能 rethrow。
-            // 这里仅记录到日志（S5 之后接入 Logger）。
-            // 现阶段：std::terminate 暴露问题，避免静默吞掉 bug。
-            std::terminate();
-        }
-    };
-};
 
 }  // namespace coro_net

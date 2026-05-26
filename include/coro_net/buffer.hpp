@@ -110,6 +110,12 @@ public:
     char* beginWrite() noexcept { return begin() + writerIndex_; }
     const char* beginWrite() const noexcept { return begin() + writerIndex_; }
 
+    // 推进 writerIndex_（io_uring 已把 n 字节直接写入了 beginWrite()）
+    void hasWritten(size_t n) noexcept {
+        assert(n <= writableBytes());
+        writerIndex_ += n;
+    }
+
 private:
     char* begin() noexcept { return buffer_.data(); }
     const char* begin() const noexcept { return buffer_.data(); }

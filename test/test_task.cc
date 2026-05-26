@@ -10,6 +10,7 @@
 // =============================================================================
 
 #include "coro_net/task.hpp"
+#include "coro_net/fire_and_forget.hpp"
 #include "test_util.hpp"
 
 #include <stdexcept>

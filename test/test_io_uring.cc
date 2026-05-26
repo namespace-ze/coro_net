@@ -1,14 +1,13 @@
 // =============================================================================
-// test_io_uring.cc — IoUring + BufferRing 基本功能测试
+// test_io_uring.cc — IoUring 基本功能测试
 // =============================================================================
 // 验证：
 //   1. IoUring 能构造、提交 NOP、收到 CQE
-//   2. BufferRing 能注册、recv 到 /dev/null（实际上用 pipe 测试更直观）
-//   3. BufferRing return_buffer 后 bid 能再次被使用
+//   2. 直接给 io_uring 一个用户 buffer 收到 socketpair 写入数据
+//      （已用 per-conn Buffer 路径取代 BufferRing，详见 plan 精简 B）
 // =============================================================================
 
 #include "coro_net/io/io_uring.h"
-#include "coro_net/io/buffer_ring.h"
 #include "test_util.hpp"
 
 #include <liburing.h>
@@ -18,7 +17,6 @@
 #include <cstring>
 
 using coro_net::IoUring;
-using coro_net::BufferRing;
 
 // -----------------------------------------------------------------------------
 // 1. NOP 提交 / 完成
@@ -44,13 +42,11 @@ CORO_TEST(iouring_nop_round_trip) {
 }
 
 // -----------------------------------------------------------------------------
-// 2. 通过 BufferRing + recv 接收 pipe 写入数据
+// 2. 直接 recv 到用户 buffer（不走 BufferRing）
 // -----------------------------------------------------------------------------
-CORO_TEST(buffer_ring_recv_from_pipe) {
+CORO_TEST(iouring_recv_into_user_buf) {
     IoUring ring(64);
-    BufferRing brg(ring.raw(), /*bgid=*/1, /*entries=*/8, /*buf_size=*/256);
 
-    // 用 AF_UNIX socketpair 测试（recv 只支持 socket fd）
     int fds[2];
     CORO_EXPECT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
 
@@ -59,12 +55,10 @@ CORO_TEST(buffer_ring_recv_from_pipe) {
     ssize_t w = write(fds[1], msg, msg_len);
     CORO_EXPECT_EQ((size_t)w, msg_len);
 
-    // 提交 recv（带 BUFFER_SELECT 标志）
+    char buf[256] = {0};
     io_uring_sqe* sqe = ring.get_sqe();
     CORO_EXPECT_TRUE(sqe != nullptr);
-    io_uring_prep_recv(sqe, fds[0], nullptr, 0, 0);
-    sqe->flags |= IOSQE_BUFFER_SELECT;
-    sqe->buf_group = 1;                            // 与 BufferRing 的 bgid 一致
+    io_uring_prep_recv(sqe, fds[0], buf, sizeof buf, 0);
     io_uring_sqe_set_data64(sqe, 0x1234);
 
     ring.submit_and_wait(1);
@@ -72,21 +66,9 @@ CORO_TEST(buffer_ring_recv_from_pipe) {
     io_uring_cqe* cqes[8];
     unsigned n = ring.peek_batch_cqe(cqes, 8);
     CORO_EXPECT_EQ(n, 1u);
-    if (cqes[0]->res < 0) {
-        std::fprintf(stderr, "  recv CQE res=%d (-errno = %d, %s)\n",
-                     cqes[0]->res, -cqes[0]->res, strerror(-cqes[0]->res));
-    }
     CORO_EXPECT_TRUE(cqes[0]->res > 0);
     CORO_EXPECT_EQ((size_t)cqes[0]->res, msg_len);
-    CORO_EXPECT_TRUE((cqes[0]->flags & IORING_CQE_F_BUFFER) != 0);
-
-    uint16_t bid = cqes[0]->flags >> IORING_CQE_BUFFER_SHIFT;
-    auto buf_view = brg.view(bid);
-    bool match = std::memcmp(buf_view.data(), msg, msg_len) == 0;
-    CORO_EXPECT_TRUE(match);
-
-    // 归还 buffer
-    brg.return_buffer(bid);
+    CORO_EXPECT_TRUE(std::memcmp(buf, msg, msg_len) == 0);
     ring.cq_advance(n);
 
     close(fds[0]);

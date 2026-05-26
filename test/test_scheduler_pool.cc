@@ -19,6 +19,7 @@
 // =============================================================================
 
 #include "coro_net/scheduler.hpp"
+#include "coro_net/scheduler_pool.hpp"
 #include "coro_net/ops.hpp"
 #include "coro_net/task.hpp"
 #include "test_util.hpp"

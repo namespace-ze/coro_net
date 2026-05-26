@@ -163,10 +163,10 @@ public:
         io_uring_cq_advance(&ring_, n);
     }
 
-    // 给底层 io_uring* 指针；BufferRing/RegisteredFiles 注册时要用
+    // 给底层 io_uring* 指针；RegisteredFiles 等高级注册时要用
     io_uring* raw() noexcept { return &ring_; }
 
-    // ring_fd 用于 MSG_RING 跨线程派发时作为目标 ring 的标识
+    // ring_fd（保留访问器，供后续诊断 / 监控用）
     int ring_fd() const noexcept { return ring_.ring_fd; }
 
     uint32_t features() const noexcept { return features_; }

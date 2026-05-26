@@ -1,8 +1,13 @@
 // =============================================================================
-// net/tcp.cc — TcpConnection / IdleConnectionWheel / TcpServer 实现
+// tcp_server.cc — TcpServer 实现
+// =============================================================================
+// 监听 + accept 分发：worker[0] 跑 accept 循环，其余 worker 处理连接。
+// 每个 worker 各自挂一个 IdleConnectionWheel（在 tcp_server.cc 中构造，
+// 但 tick_coro 必须 spawn 到 worker 线程上）。
 // =============================================================================
 #include "coro_net/tcp.hpp"
 #include "coro_net/ops.hpp"
+#include "coro_net/log.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -15,106 +20,6 @@
 
 namespace coro_net {
 
-// =============================================================================
-// IdleEntry 析构 —— 时间轮把这个 entry 完全淘汰时（所有桶都没有引用），
-// 触发关闭对应连接的协程
-// =============================================================================
-IdleEntry::~IdleEntry() {
-    auto c = wconn.lock();
-    if (!c || !sched) return;
-
-    // spawn 关闭协程：必须在 sched 所属的 worker 线程上运行；
-    // 但 ~IdleEntry 是从 buckets_.push_back 触发的，调用方是 wheel.tick_coro
-    // ——已经在 sched 线程上了。所以可以直接 spawn。
-    //
-    // 不能直接 c->shutdown()，因为 shutdown 是 Task<void> 需要 await；
-    // 这里我们在析构里没法 co_await。
-    sched->spawn([](TcpConnectionPtr c_) -> Task<void> {
-        co_await c_->shutdown();
-        co_return;
-    }(c));
-}
-
-// =============================================================================
-// TcpConnection 实现
-// =============================================================================
-Task<ssize_t> TcpConnection::recv(Buffer& buf) {
-    ssize_t n = co_await RecvIntoBufferAwaiter{fd_, buf, *sched_};
-    // 续命：每次有数据进来就把自己重新插入队尾桶
-    if (n > 0 && wheel_) {
-        if (auto e = idle_entry_.lock()) {
-            wheel_->refresh(e);
-        }
-    }
-    co_return n;
-}
-
-Task<ssize_t> TcpConnection::send(std::span<const char> data) {
-    size_t remaining = data.size();
-    const char* p = data.data();
-    ssize_t total = 0;
-    while (remaining > 0) {
-        ssize_t n = co_await SendAwaiter{fd_, p, remaining, *sched_};
-        if (n < 0) co_return n;
-        if (n == 0) co_return total;
-        total += n;
-        p += n;
-        remaining -= n;
-    }
-    co_return total;
-}
-
-Task<void> TcpConnection::shutdown() {
-    if (fd_ < 0) co_return;
-    co_await ShutdownAwaiter{fd_, SHUT_RDWR, *sched_};
-    co_return;
-}
-
-// =============================================================================
-// IdleConnectionWheel 实现
-// =============================================================================
-IdleConnectionWheel::IdleConnectionWheel(Scheduler& s, std::chrono::seconds idle)
-    : sched_(&s), buckets_(idle.count() > 0 ? (size_t)idle.count() : 1) {
-    // 预填 N 个空桶
-    size_t N = idle.count() > 0 ? (size_t)idle.count() : 1;
-    for (size_t i = 0; i < N; ++i) {
-        buckets_.push_back(Bucket{});
-    }
-}
-
-void IdleConnectionWheel::start() {
-    running_.store(true, std::memory_order_relaxed);
-    sched_->spawn(tick_coro());
-}
-
-std::shared_ptr<IdleEntry> IdleConnectionWheel::register_conn(
-    std::weak_ptr<TcpConnection> c) {
-    // 注意：使用显式构造函数，避免 IdleEntry{...} 聚合初始化产生临时对象，
-    // 该临时对象的析构会被 ~IdleEntry 误判为"超时淘汰"，从而立即关闭新连接。
-    auto e = std::make_shared<IdleEntry>(std::move(c), sched_);
-    buckets_.back().insert(e);
-    return e;
-}
-
-void IdleConnectionWheel::refresh(const std::shared_ptr<IdleEntry>& e) {
-    if (e) buckets_.back().insert(e);
-}
-
-Task<void> IdleConnectionWheel::tick_coro() {
-    using namespace std::chrono_literals;
-    while (running_.load(std::memory_order_relaxed)) {
-        co_await TimeoutAwaiter{1s, *sched_};
-        if (!running_.load(std::memory_order_relaxed)) break;
-        // push_back 空桶：覆盖最旧桶 → 旧桶中所有 shared_ptr<IdleEntry>
-        // 引用计数减一；若该 entry 不再被其它桶持有 → ~IdleEntry → 关闭连接
-        buckets_.push_back(Bucket{});
-    }
-    co_return;
-}
-
-// =============================================================================
-// TcpServer 实现
-// =============================================================================
 TcpServer::TcpServer(InetAddress addr, size_t worker_threads)
     : addr_(addr), pool_(worker_threads == 0 ? 1 : worker_threads) {
     if (worker_threads == 0) worker_threads = 1;
@@ -156,6 +61,8 @@ void TcpServer::start() {
     if (running_.exchange(true)) return;
 
     listen_fd_ = make_listen_socket(addr_);
+    LOG_INFO << "TcpServer listening fd=" << listen_fd_
+             << " workers=" << pool_.size();
 
     // 为每个 worker 预创建并启动时间轮（如果配置了 idle 超时）
     wheels_.resize(pool_.size());
@@ -219,6 +126,7 @@ void TcpServer::start() {
 
 void TcpServer::stop() {
     if (!running_.exchange(false)) return;
+    LOG_INFO << "TcpServer stopping";
 
     // 关闭 listen fd → 让 accept_awaiter 收到 -ECANCELED 或 -EBADF，退出循环
     if (listen_fd_ >= 0) {
