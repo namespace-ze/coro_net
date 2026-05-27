@@ -95,7 +95,7 @@ void TcpServer::start() {
                             : (1 + (size_t)conn % (server->pool_.size() - 1));
                 // 当 size==1 时所有都在 0；否则避开 0
                 if (server->pool_.size() > 1) {
-                    // 用 fd 做 hash 避免 round-robin 偏置（教学版简化）
+                    // 用 fd 做 hash 避免 round-robin 偏置, 待优化
                 }
                 Scheduler* target = &server->pool_.at(idx);
                 IdleConnectionWheel* wheel = server->wheels_[idx].get();

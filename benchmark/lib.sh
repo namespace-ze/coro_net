@@ -106,22 +106,23 @@ make_message() {
 
 # 跑一次 tcpkali，输出 raw 文本到 stdout
 # 参数：conns duration [extra_args...]
-# 注意：tcpkali 默认 --connect-rate=100，对大连接数会撞 duration。这里按 conns*10
-#       (但不低于 1000) 自动放宽。调用方再传 --connect-rate 会覆盖。
-# 错误处理：tcpkali 非零退出（如 TIME-WAIT 端口耗尽）不传播为 fatal——
-#         返回时 stdout 含原始输出，parse_tcpkali 在缺数据时填 0。
-#         调用方判失败：检查 parse_tcpkali 输出的 dur_s 是否为 0。
+# connect-rate 默认 1000/s（云上安全值）。原因：阿里云内网 SLB / DDoS 防护对
+# 短时间高频 SYN 做拦截，原"conns*10"在 c≥5000 时触发 50K+ SYN/s 被拦截，导致
+# tcpkali 静默失败（dur_s=1 / qps=0）。
+# 用户可通过 CONNECT_RATE 环境变量在裸金属上拉高（如 5000、10000）。
+# hard_timeout = dur + ramp + 30s，其中 ramp = conns/cr + 1，给爬坡留时间。
+# 错误处理：tcpkali 非零退出不传播为 fatal——返回时 stdout 含原始输出，
+#          parse_tcpkali 在缺数据时填 0。调用方判失败：检查 dur_s 是否为 0。
 run_tcpkali() {
     local conns="$1" dur="$2"; shift 2
     local msg cr
     msg=$(make_message "$MSG_SIZE")
-    cr=$(( conns * 10 ))
-    [ "$cr" -lt 1000 ] && cr=1000
-    # 外层 timeout：tcpkali --duration 设了上限，但极端情况（端口耗尽）下
-    # 可能卡在连接阶段，timeout 兜底防止脚本永远挂住
-    # duration "10s" → 取数字 10，再 +20s 余量
+    cr="${CONNECT_RATE:-1000}"
+    # 外层 timeout 兜底：tcpkali --duration 限了主测时长，但爬坡 + 端口耗尽时
+    # 可能卡更久。ramp = conns/cr，留 30s 余量。
     local dur_num="${dur%[smh]}"
-    local hard_timeout=$(( dur_num + 30 ))
+    local ramp=$(( conns / cr + 1 ))
+    local hard_timeout=$(( dur_num + ramp + 30 ))
     # set +e 局部，避免 lib.sh 顶部的 -e 把 tcpkali 的非零退出当致命错误
     set +e
     timeout "${hard_timeout}s" tcpkali \
@@ -188,9 +189,16 @@ median() {
 }
 
 # 等 TIME-WAIT 数量降到阈值以下。参数：max_wait_s threshold
-# 用途：高连接数测试之间，避免端口耗尽。tcp_tw_reuse=1 开启时几乎瞬间返回
+# 用途：高连接数测试之间，避免端口耗尽。
+# tcp_tw_reuse=1 或 =2 时内核允许 TIME-WAIT 端口被新出向连接复用，
+# 此时等 drain 是无谓的——直接返回 0。
 wait_for_drain() {
     local max="${1:-90}" thr="${2:-2000}"
+    local twr
+    twr=$(cat /proc/sys/net/ipv4/tcp_tw_reuse 2>/dev/null || echo 0)
+    if [ "$twr" != "0" ]; then
+        return 0
+    fi
     local elapsed=0
     while [ "$elapsed" -lt "$max" ]; do
         local n

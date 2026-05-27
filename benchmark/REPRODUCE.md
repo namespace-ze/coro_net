@@ -116,6 +116,7 @@ bash benchmark/run_worker_scaling.sh
 | `MSG_SIZE` | `64` | 消息字节数（含 latency marker `@`） |
 | `OUT_DIR` | `benchmark/results/<local|cloud>/<ts>` | 输出目录 |
 | `TCPKALI_WORKERS` | `4` | tcpkali 自身线程数 |
+| `CONNECT_RATE` | `1000` | tcpkali 建连接速率（SYN/s）。**云上保持默认**，否则会被云厂商 SYN flood 防护拦截（见 §8）。裸金属可拉到 5000-10000。 |
 
 ---
 
@@ -194,6 +195,12 @@ tcpkali 这一轮失败，没产生有效输出。看同名 `.log` 找 `[tcpkali
 ### REMOTE 模式下 `cannot reach <host>:<port>`
 - server 机器上 `./benchmark/server_runner.sh 4` 没起，或起在不同端口
 - 云厂安全组没放行 client IP 到 server 18002
+
+### 云厂商 SYN flood 拦截（≥5000 conn 静默 0 QPS）
+**症状**：100 / 1000 conn 正常出数，5000 / 10000 conn 三轮全是 `qps=0` + `duration_s=1`，但 server 端没崩没报错。
+**原因**：阿里云 / AWS / GCP 等云厂内网 SLB / DDoS 防护对**短时间高频 SYN** 做拦截。tcpkali 默认 `--connect-rate=100` 不会触发，但脚本旧版按 `conns*10` 自动放宽（c=5000 时是 50000/s SYN）会被云防火墙静默丢包，于是 tcpkali 建不够连接，提早退出。
+**缓解**：lib.sh 现已固定默认 `CONNECT_RATE=1000`（云上安全值）。**云上不要覆盖**。如需更高，先在裸金属或私有内网验证云厂规则。
+**真实案例**：阿里云 8C32G × 2，c=5000 默认 cr=50000 全失败；改 cr=1000 后 `21.3 Gbps / 60s 全跑完`、c=10000 → `16.3 Gbps`。
 
 ---
 
@@ -348,6 +355,8 @@ iperf3 -c 172.16.0.5 -t 10 -P 4
 
 ### Step 3：测试 A / B / C（固定 4 worker，~30 分钟）
 
+> **关键**：默认 `CONNECT_RATE=1000` 是阿里云 SLB 安全值（见 §8）。**云上不要改**。conn ≥ 5000 时 `DURATION` 必须 ≥ 60s（爬坡 10s + 实测都要时间）。
+
 **两个 SSH 窗口对照操作**：
 
 ```text
@@ -452,5 +461,6 @@ ls bench_results_aliyun_*/
 | `cannot reach 172.16.0.5:18002` | Step 0 安全组、Step 4 server 是否在跑 |
 | iperf3 跑不到 1 Gbps | Step 2 + 控制台确认实例族不是突发型 |
 | CSV 某行 `duration_s=1` | §8 排错；通常是 sysctl 没调 |
+| **≥5000 conn 三轮全 0 QPS** | §8 "云厂商 SYN flood 拦截"；保持默认 `CONNECT_RATE=1000`，不要拉高 |
 | `connect: cannot assign requested address` | §3 `ip_local_port_range` / `tcp_tw_reuse=1` |
 | QPS 数字比 §9 预期低 10x | Release 编译？sysctl 全套？iperf3 底数 OK？|
