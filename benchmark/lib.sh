@@ -122,8 +122,11 @@ run_tcpkali() {
     # 可能卡更久。ramp = conns/cr，留 30s 余量。
     local dur_num="${dur%[smh]}"
     local ramp=$(( conns / cr + 1 ))
-    local hard_timeout=$(( dur_num + ramp + 30 ))
+    local hard_timeout=$(( dur_num + ramp + 60 ))
     # set +e 局部，避免 lib.sh 顶部的 -e 把 tcpkali 的非零退出当致命错误
+    # 不用 --verbose 2：高 conn + 4 worker 下 tcpkali 高频 stats 输出会把
+    # bash $(...) 的 stdout 管道堵死，导致测试结束后 tcpkali 卡在 write() 不退出。
+    # 最终 "Latency at percentiles" 那行就够我们 parse 所有要的指标，verbose 多余。
     set +e
     timeout "${hard_timeout}s" tcpkali \
         --workers "$TCPKALI_WORKERS" \
@@ -132,15 +135,14 @@ run_tcpkali() {
         --duration "$dur" \
         --latency-marker '@' \
         -m "$msg" \
-        --verbose 2 \
         "$@" \
         "$HOST:$PORT" 2>&1
     local ec=$?
     set -e
     if [ "$ec" -eq 124 ]; then
-        echo "[tcpkali] HARD TIMEOUT after ${hard_timeout}s (likely TIME-WAIT exhaustion)"
+        echo "[tcpkali] HARD TIMEOUT after ${hard_timeout}s"
     elif [ "$ec" -ne 0 ]; then
-        echo "[tcpkali] exit=$ec (likely TIME-WAIT port exhaustion or connect timeout)"
+        echo "[tcpkali] exit=$ec"
     fi
     return 0
 }

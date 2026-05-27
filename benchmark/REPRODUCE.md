@@ -202,6 +202,12 @@ tcpkali 这一轮失败，没产生有效输出。看同名 `.log` 找 `[tcpkali
 **缓解**：lib.sh 现已固定默认 `CONNECT_RATE=1000`（云上安全值）。**云上不要覆盖**。如需更高，先在裸金属或私有内网验证云厂规则。
 **真实案例**：阿里云 8C32G × 2，c=5000 默认 cr=50000 全失败；改 cr=1000 后 `21.3 Gbps / 60s 全跑完`、c=10000 → `16.3 Gbps`。
 
+### `[tcpkali] HARD TIMEOUT` 在 c≥5000 / Ramped up 之后才打死
+**症状**：raw log 显示 `Ramped up to N connections.` 成功了，60s `--duration` 也到了，但 tcpkali 不退出，被外层 `timeout` 杀。
+**原因**：高 conn + 多 worker 下若加了 `--verbose 2`，tcpkali 每秒每 worker dump 一大坨 stats，shell `$(...)` 子进程的 stdout pipe buffer (~64KB) 会被堵满 → tcpkali 在 write() 系统调用阻塞 → 测试结束后停不下来。
+**缓解**：lib.sh 已**不再用 `--verbose 2`**。最终 `Latency at percentiles` 那行就够 parse 所有指标，不需要 verbose。
+**别加回来**：以后想拿 per-worker stats 来 debug 时，用 `tcpkali ... > raw.log 2>&1` 直接写文件（不通过 `$()`），不要再放回 lib.sh 默认参数。
+
 ---
 
 ## 9. 预期数据范围（参考）
