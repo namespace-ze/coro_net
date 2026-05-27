@@ -115,7 +115,7 @@ bash benchmark/run_worker_scaling.sh
 | `ROUNDS` | `1` | 每数据点重复轮数，取中位 |
 | `MSG_SIZE` | `64` | 消息字节数（含 latency marker `@`） |
 | `OUT_DIR` | `benchmark/results/<local|cloud>/<ts>` | 输出目录 |
-| `TCPKALI_WORKERS` | `4` | tcpkali 自身线程数 |
+| `TCPKALI_WORKERS` | `$(nproc)` | tcpkali 自身线程数，默认 = client 核数。**不要降**——4 worker 在 ≥10K conn + `--latency-marker` 下 client CPU 顶不住，建连卡住 |
 | `CONNECT_RATE` | `1000` | tcpkali 建连接速率（SYN/s）。**云上保持默认**，否则会被云厂商 SYN flood 防护拦截（见 §8）。裸金属可拉到 5000-10000。 |
 
 ---
@@ -201,6 +201,12 @@ tcpkali 这一轮失败，没产生有效输出。看同名 `.log` 找 `[tcpkali
 **原因**：阿里云 / AWS / GCP 等云厂内网 SLB / DDoS 防护对**短时间高频 SYN** 做拦截。tcpkali 默认 `--connect-rate=100` 不会触发，但脚本旧版按 `conns*10` 自动放宽（c=5000 时是 50000/s SYN）会被云防火墙静默丢包，于是 tcpkali 建不够连接，提早退出。
 **缓解**：lib.sh 现已固定默认 `CONNECT_RATE=1000`（云上安全值）。**云上不要覆盖**。如需更高，先在裸金属或私有内网验证云厂规则。
 **真实案例**：阿里云 8C32G × 2，c=5000 默认 cr=50000 全失败；改 cr=1000 后 `21.3 Gbps / 60s 全跑完`、c=10000 → `16.3 Gbps`。
+
+### c=10000 卡在 ramp-up 不报错（log 里没 `Ramped up to N connections.`）
+**症状**：raw log 显示 tcpkali 启动后只有 `Destination: [...]:18002` 一行，没看到 `Ramped up to ...`，最终被 HARD TIMEOUT 杀。c=5000 正常但 c=10000 卡。
+**原因**：tcpkali 默认 4 worker 时，每个 worker 要管 2500 个 conn + `--latency-marker` 逐字节扫描，client CPU 顶不住，建连阶段就跟不上。
+**缓解**：lib.sh 现已把 `TCPKALI_WORKERS` 默认改成 `$(nproc)`。8 核 client 上自动是 8 worker，c=10000 顺利 ramp。
+**真实案例**：阿里云 8C32G client，TCPKALI_WORKERS=4 c=10000 完全卡死；改 TCPKALI_WORKERS=8 后 32.9M msg/s 跑完 60s。
 
 ### `[tcpkali] HARD TIMEOUT` 在 c≥5000 / Ramped up 之后才打死
 **症状**：raw log 显示 `Ramped up to N connections.` 成功了，60s `--duration` 也到了，但 tcpkali 不退出，被外层 `timeout` 杀。

@@ -21,7 +21,9 @@ PORT="${PORT:-18002}"
 DURATION="${DURATION:-10s}"         # 单次测试时长（如 10s / 30s / 60s）
 ROUNDS="${ROUNDS:-1}"               # 每个数据点重复轮数（用于取中位）
 MSG_SIZE="${MSG_SIZE:-64}"          # 消息大小（字节，含 latency marker）
-TCPKALI_WORKERS="${TCPKALI_WORKERS:-4}"  # tcpkali 自身线程数
+# tcpkali 自身线程数。默认 = client 核数（用 nproc 探测），不够会卡 ≥10K conn
+# 的 latency-marker 扫描——实测 8 核 client 上 -c 10000 需要 8 worker 才能 ramp 完
+TCPKALI_WORKERS="${TCPKALI_WORKERS:-$(nproc 2>/dev/null || echo 4)}"
 
 # ---- 输出目录 ----
 if [ -z "${OUT_DIR:-}" ]; then
