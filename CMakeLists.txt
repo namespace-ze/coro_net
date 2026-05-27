@@ -14,6 +14,10 @@ cmake_minimum_required(VERSION 3.13)
 
 project(coro_net LANGUAGES CXX)
 
+#让 CMake 在构建时生成一个 compile_commands.json 文件
+#这个文件会精确记录每一个 .cc 文件是用什么参数、什么路径编译的
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # 这是一个独立子项目，强制 C++20（顶层项目目前还是 C++17，
 # 等到 S8 阶段集成时再把顶层切到 20。这里先用 target 级别的设置）。
 set(CMAKE_CXX_STANDARD 20)

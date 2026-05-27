@@ -53,9 +53,9 @@ int main(int argc, char** argv) {
     server.start();
 
     // 心跳：每 5 秒在 worker[0] 上打一行（演示 Timer）
-    server.pool().at(0).run_every(std::chrono::seconds(5), [] {
-        LOG_INFO << "heartbeat";
-    });
+    // server.pool().at(0).run_every(std::chrono::seconds(5), [] {
+    //     LOG_INFO << "heartbeat";
+    // });
 
     server.wait();
     LOG_INFO << "exited";
