@@ -34,13 +34,24 @@ int main(int argc, char** argv) {
 
     server.set_handler([](coro_net::TcpConnectionPtr conn)
                        -> coro_net::Task<void> {
-        coro_net::Buffer buf;
-        while (true) {
-            ssize_t n = co_await conn->recv(buf);
-            if (n <= 0) break;
-            // 整段回显
-            std::string s = buf.retrieveAllAsString();
-            co_await conn->send(s);
+        if (conn->has_fixed_slot()) {
+            // 固定注册缓冲零拷贝路径：read_fixed 进 slot，再从同一 slot write_fixed。
+            while (true) {
+                auto v = co_await conn->recv_fixed();
+                if (v.n <= 0) break;
+                ssize_t s = co_await conn->send_fixed(v.data,
+                                                      static_cast<size_t>(v.n));
+                if (s < 0) break;
+            }
+        } else {
+            // 回退路径（无固定缓冲池：未启用 / 池满 / memlock 不足）。
+            coro_net::Buffer buf;
+            while (true) {
+                ssize_t n = co_await conn->recv(buf);
+                if (n <= 0) break;
+                std::string s = buf.retrieveAllAsString();
+                co_await conn->send(s);
+            }
         }
         co_await conn->shutdown();
         co_return;

@@ -30,7 +30,14 @@ namespace coro_net {
 
 class SchedulerPool {
 public:
-    explicit SchedulerPool(size_t n);
+    // n            ：worker（Scheduler）数量
+    // base         ：每个 Scheduler 的基础配置（ring_entries / sqpoll / 固定缓冲等）
+    // sqpoll_threads(M)：SQPOLL 轮询线程数。仅当 base.sqpoll 为真时生效：
+    //                 把 n 个 ring 分成 M 组，每组组首 ring 自建轮询线程，
+    //                 组内其余 ring 经 ATTACH_WQ 复用组首的轮询线程
+    //                 （M 个 kthread 服务 N 个 ring，M≤N）。M=0 等价每 ring 一个线程。
+    explicit SchedulerPool(size_t n, SchedulerConfig base = {},
+                           unsigned sqpoll_threads = 0);
     ~SchedulerPool();
 
     SchedulerPool(const SchedulerPool&) = delete;

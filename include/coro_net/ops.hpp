@@ -18,6 +18,8 @@
 #include "coro_net/ops/accept.hpp"
 #include "coro_net/ops/recv.hpp"
 #include "coro_net/ops/recv_into_buffer.hpp"
+#include "coro_net/ops/recv_fixed.hpp"
 #include "coro_net/ops/send.hpp"
+#include "coro_net/ops/send_fixed.hpp"
 #include "coro_net/ops/timeout.hpp"
 #include "coro_net/ops/shutdown.hpp"

@@ -7,6 +7,7 @@
 #include "coro_net/scheduler.hpp"
 #include "coro_net/io_operation.hpp"
 #include "coro_net/io/io_uring.h"
+#include "coro_net/registered_buffer_pool.hpp"
 #include "coro_net/log.hpp"
 #include "coro_net/timer/timer_id.hpp"
 #include "coro_net/timer/timer_queue.hpp"
@@ -65,16 +66,44 @@ private:
 // 构造：建 ring + eventfd watcher + TimerQueue
 // -----------------------------------------------------------------------------
 Scheduler::Scheduler(SchedulerConfig cfg) {
-    ring_ = std::make_unique<IoUring>(cfg.ring_entries);
+    IoUringParams p{};
+    p.entries           = cfg.ring_entries;
+    p.sqpoll            = cfg.sqpoll;
+    p.sq_thread_idle_ms = cfg.sq_thread_idle_ms;
+    p.wq_fd             = cfg.wq_fd;
+    ring_ = std::make_unique<IoUring>(p);
+    if (cfg.sqpoll && !ring_->sqpoll_active()) {
+        LOG_WARN << "Scheduler@" << static_cast<const void*>(this)
+                 << " requested SQPOLL but it was rejected; running without it";
+    }
+
     // eventfd：用于跨线程唤醒。EFD_NONBLOCK 让 read 不阻塞；
     // 读到 0 也无所谓——我们用 io_uring 异步读，syscall 行为在这里不重要。
     wake_fd_ = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     wake_watcher_ = std::make_unique<EventfdWatcher>(*this, wake_fd_);
     timer_queue_ = std::make_unique<TimerQueue>(*this);
+
+    // 固定注册缓冲池：注册一次（pin 内存）。失败则 enabled()=false，全程回退。
+    if (cfg.use_fixed_buffers && cfg.buf_pool_capacity > 0) {
+        buf_pool_ = std::make_unique<RegisteredBufferPool>(
+            ring_->raw(), cfg.buf_pool_capacity, cfg.buf_slot_size);
+        if (buf_pool_->enabled()) {
+            LOG_INFO << "Scheduler@" << static_cast<const void*>(this)
+                     << " registered buffer pool: " << buf_pool_->capacity()
+                     << " x " << buf_pool_->slot_size() << "B";
+        } else {
+            LOG_WARN << "Scheduler@" << static_cast<const void*>(this)
+                     << " register_buffers failed (errno="
+                     << buf_pool_->reg_errno()
+                     << ", likely RLIMIT_MEMLOCK too low); falling back to heap Buffer";
+            buf_pool_.reset();  // 置空，调用方据此回退
+        }
+    }
 }
 
 Scheduler::~Scheduler() {
-    timer_queue_.reset();   // 先关 timerfd（释放它在 ring 上挂的 read）
+    buf_pool_.reset();      // 先 unregister_buffers（此时 ring_ 仍有效）
+    timer_queue_.reset();   // 再关 timerfd（释放它在 ring 上挂的 read）
     if (wake_fd_ >= 0) ::close(wake_fd_);
 }
 

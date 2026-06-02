@@ -5,13 +5,35 @@
 // 通过 round-robin 把新工作派发到不同 worker 上。
 // =============================================================================
 #include "coro_net/scheduler_pool.hpp"
+#include "coro_net/io/io_uring.h"
+#include "coro_net/log.hpp"
 
 namespace coro_net {
 
-SchedulerPool::SchedulerPool(size_t n) {
+SchedulerPool::SchedulerPool(size_t n, SchedulerConfig base, unsigned M) {
     schedulers_.reserve(n);
+
+    // 是否做 SQPOLL 分组：把 n 个 ring 分成 M 组，组首自建轮询线程，
+    // 其余经 ATTACH_WQ 复用组首线程。M=0（或非 sqpoll）时退化为每 ring 独立。
+    const bool   grouping = base.sqpoll && M > 0;
+    const size_t gsz = grouping ? (n + M - 1) / M : 1;  // ceil(n/M)
+
     for (size_t i = 0; i < n; ++i) {
-        schedulers_.emplace_back(std::make_unique<Scheduler>());
+        SchedulerConfig cfg = base;
+        cfg.wq_fd = -1;
+        if (grouping) {
+            const size_t leader = (i / gsz) * gsz;       // 本组组首下标
+            if (i != leader) {
+                // 组首已先构造，复用其轮询线程。
+                cfg.wq_fd = schedulers_[leader]->ring().ring_fd();
+            }
+        }
+        schedulers_.emplace_back(std::make_unique<Scheduler>(cfg));
+    }
+
+    if (grouping) {
+        LOG_INFO << "SchedulerPool: " << n << " rings, " << M
+                 << " SQPOLL poller thread(s) (group size " << gsz << ")";
     }
 }
 

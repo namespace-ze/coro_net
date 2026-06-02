@@ -38,13 +38,16 @@
 //     声明这个 ring 只会被一个线程使用，内核可省去 ring 内部同步开销。
 //     与我们的模型 A "每线程一个 ring" 完美契合。
 //
-// 【为什么不用 SQPOLL】
+// 【SQPOLL（优化阶段已启用，可配置）】
 //   IORING_SETUP_SQPOLL 让内核额外起一个 kthread 轮询 SQ tail，
-//   省掉 io_uring_enter 系统调用，延迟最低。但代价：
-//     - 占一个 CPU 核
-//     - kernel < 5.13 需要 CAP_SYS_NICE 权限
-//     - 调试时 ring 状态可能瞬时不一致，加大排错难度
-//   教学项目优先清晰，不开 SQPOLL。
+//   省掉 io_uring_enter 系统调用，延迟最低。代价是占一个 CPU 核。
+//   为避免 N 个 worker = N 个轮询线程烧 N 核，我们用 IORING_SETUP_ATTACH_WQ
+//   让多个 ring 共享同一个轮询线程（M 个轮询线程服务 N 个 ring，M<N）：
+//   组首 ring 自带轮询线程，组内其余 ring 设 wq_fd = 组首 ring_fd 复用之。
+//   sq_thread_idle 控制轮询线程空闲多久后休眠（休眠后下次 submit 由 liburing
+//   通过 IORING_ENTER_SQ_WAKEUP 唤醒）。
+//   kernel 6.6 下非特权即可用 SQPOLL；若环境拒绝（-EPERM）或拒绝某组合
+//   （-EINVAL），构造函数会按候选 flag 列表依次回退，最差退回到普通 ring。
 // =============================================================================
 
 #pragma once
@@ -54,8 +57,19 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace coro_net {
+
+// -----------------------------------------------------------------------------
+// IoUringParams —— 构造 IoUring 的底层参数（与 SchedulerConfig 解耦）
+// -----------------------------------------------------------------------------
+struct IoUringParams {
+    unsigned entries = 8192;          // SQ/CQ 容量（向上对齐到 2 的幂）
+    bool     sqpoll = false;          // 是否启用 IORING_SETUP_SQPOLL
+    unsigned sq_thread_idle_ms = 1000;// 轮询线程空闲多久（ms）后休眠
+    int      wq_fd = -1;              // >=0：ATTACH_WQ 复用该 ring 的轮询线程
+};
 
 // -----------------------------------------------------------------------------
 // IoUring —— 单 io_uring 实例
@@ -67,30 +81,49 @@ namespace coro_net {
 // -----------------------------------------------------------------------------
 class IoUring {
 public:
-    // entries：SQ/CQ 的容量。会被内核向上对齐到 2 的幂；建议 256~4096。
-    //         队列满时 get_sqe() 返回 nullptr，调用方应先 submit() 再重试。
-    explicit IoUring(unsigned entries) {
-        io_uring_params params{};
-        // 启用：
-        //   IORING_SETUP_COOP_TASKRUN —— 完成事件不主动中断用户态，
-        //                              省 IRQ 开销，几乎免费。
-        //
-        // 不启用 SINGLE_ISSUER：该 flag 要求"提交 SQE 的线程必须是创建 ring
-        // 的线程"，否则 io_uring_enter 返回 -EEXIST。我们的 Scheduler 由
-        // 主线程构造（构造时创建 ring）、由 worker 线程跑 run()（即提交
-        // SQE），违反该约束。性能损失忽略不计（教学项目）。
-        // 真正想用 SINGLE_ISSUER，得用 IORING_SETUP_R_DISABLED + 在 worker
-        // 线程上调用 io_uring_enable_rings，本库后续优化阶段再考虑。
-        params.flags = IORING_SETUP_COOP_TASKRUN;
+    // 兼容旧调用：只给 entries（等价于无 SQPOLL 的普通 ring）。
+    explicit IoUring(unsigned entries) : IoUring(IoUringParams{.entries = entries}) {}
 
-        int ret = io_uring_queue_init_params(entries, &ring_, &params);
-        if (ret < 0) {
-            // ret 是负 errno
-            throw std::system_error(-ret, std::system_category(),
-                                    "io_uring_queue_init_params failed");
+    // 主构造：按 IoUringParams 组装 setup flags，失败时按候选列表优雅回退。
+    //
+    // 候选顺序（取第一个成功的）：
+    //   1) 用户请求的完整 flag（COOP_TASKRUN [+ SQPOLL] [+ ATTACH_WQ]）
+    //   2) 去掉 COOP_TASKRUN（个别内核拒绝 COOP_TASKRUN + SQPOLL 组合，-EINVAL）
+    //   3) 去掉 SQPOLL/ATTACH_WQ，仅 COOP_TASKRUN（SQPOLL 被拒 -EPERM 时）
+    //   4) 全部清零（最保守）
+    //
+    // 不启用 SINGLE_ISSUER：见文件头注释（ring 由主线程构造、worker 线程提交）。
+    explicit IoUring(const IoUringParams& p) {
+        unsigned full = IORING_SETUP_COOP_TASKRUN;
+        if (p.sqpoll)       full |= IORING_SETUP_SQPOLL;
+        if (p.wq_fd >= 0)   full |= IORING_SETUP_ATTACH_WQ;
+
+        std::vector<unsigned> candidates;
+        candidates.push_back(full);
+        if (full & IORING_SETUP_COOP_TASKRUN)
+            candidates.push_back(full & ~IORING_SETUP_COOP_TASKRUN);
+        // 退掉 SQPOLL 也必须退掉 ATTACH_WQ（它依赖共享的 SQPOLL 组）
+        candidates.push_back(IORING_SETUP_COOP_TASKRUN);
+        candidates.push_back(0u);
+
+        int ret = -EINVAL;
+        for (unsigned flags : candidates) {
+            io_uring_params params{};
+            params.flags = flags;
+            if (flags & IORING_SETUP_SQPOLL)
+                params.sq_thread_idle = p.sq_thread_idle_ms;
+            if (flags & IORING_SETUP_ATTACH_WQ)
+                params.wq_fd = static_cast<unsigned>(p.wq_fd);
+
+            ret = io_uring_queue_init_params(p.entries, &ring_, &params);
+            if (ret == 0) {
+                features_ = params.features;
+                sqpoll_active_ = (flags & IORING_SETUP_SQPOLL) != 0;
+                return;
+            }
         }
-        // 这里可以保存 params.features 字段，按需检测高阶特性是否可用
-        features_ = params.features;
+        throw std::system_error(-ret, std::system_category(),
+                                "io_uring_queue_init_params failed");
     }
 
     ~IoUring() {
@@ -171,9 +204,13 @@ public:
 
     uint32_t features() const noexcept { return features_; }
 
+    // SQPOLL 是否最终生效（可能因 -EPERM 回退而为 false）
+    bool sqpoll_active() const noexcept { return sqpoll_active_; }
+
 private:
     io_uring ring_{};
     uint32_t features_ = 0;
+    bool     sqpoll_active_ = false;
 };
 
 }  // namespace coro_net

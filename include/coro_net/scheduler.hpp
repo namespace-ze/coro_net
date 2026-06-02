@@ -87,13 +87,23 @@ namespace coro_net {
 
 class IoUring;
 class TimerQueue;
+class RegisteredBufferPool;
 
 // -----------------------------------------------------------------------------
 // SchedulerConfig：构造 Scheduler 时的参数
 // -----------------------------------------------------------------------------
-// BufferRing 已废除（io_uring 直接写 per-conn Buffer），不再有 buf_ring_* 配置。
 struct SchedulerConfig {
-    unsigned ring_entries = 1024;       // SQ/CQ 容量
+    unsigned ring_entries = 8192;        // SQ/CQ 容量（高并发下需足够大，见 get_sqe 风险）
+
+    // --- SQPOLL（默认关闭；由 TcpServer 按 set_sqpoll_threads 开启，单元测试不受影响）---
+    bool     sqpoll = false;             // 启用 IORING_SETUP_SQPOLL
+    unsigned sq_thread_idle_ms = 1000;   // 轮询线程空闲多久（ms）后休眠
+    int      wq_fd = -1;                 // >=0：ATTACH_WQ 复用该 ring 的轮询线程
+
+    // --- 固定注册缓冲池（默认关闭；由 TcpServer 按 set_fixed_buffers 开启）---
+    bool     use_fixed_buffers = false;  // 注册固定缓冲池（io_uring_register_buffers）
+    unsigned buf_slot_size = 16 * 1024;  // 每 slot 字节
+    unsigned buf_pool_capacity = 0;      // slot 数（0 = 不建池）
 };
 
 class Scheduler {
@@ -169,6 +179,9 @@ public:
     IoUring& ring() noexcept { return *ring_; }
     TimerQueue& timer_queue() noexcept { return *timer_queue_; }
 
+    // 固定注册缓冲池（可能为 nullptr：未启用或注册失败回退）。
+    RegisteredBufferPool* buffer_pool() noexcept { return buf_pool_.get(); }
+
     // Timer 便捷接口（详见 timer/timer_queue.hpp）；同线程返回有效 TimerId，
     // 跨线程会 post_task bounce 但返回空 TimerId。
     TimerId run_after(std::chrono::nanoseconds delay, std::function<void()> fn);
@@ -187,6 +200,7 @@ private:
 
     std::unique_ptr<IoUring> ring_;
     std::unique_ptr<TimerQueue> timer_queue_;
+    std::unique_ptr<RegisteredBufferPool> buf_pool_;
     std::deque<std::coroutine_handle<>> ready_;
     std::atomic_bool stopping_{false};
 
