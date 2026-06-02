@@ -7,6 +7,9 @@
 > 阅读建议：
 > - 完全新手 → 顺序读 §一 → §二 → §三
 > - 已懂压测 → 直接看 §二 报告
+>
+> **当前状态**：测试套件已按 **16 vCPU 64GiB × 2** 双机重构（6 类测试 A–F）。§二 数据为
+> **待测占位**，等云上跑完用 `benchmark/results/` 的 CSV 回填。方法论（§一）与脚本（§三）就绪。
 
 ---
 
@@ -19,10 +22,11 @@
 1. **功能性能**：在典型负载下能跑到多少 QPS / 多大带宽
 2. **极限容量**：单机能撑多少连接、什么时候开始降级
 3. **瓶颈分析**：性能到达上限时，CPU / 网卡 / 内存 / 锁 哪一项先饱和
+4. **资源效率**：每请求花几个 syscall、每连接占多少内存——"省"和"快"同样重要
 
 面试官问"你的库性能如何"时，理想回答模板：
 
-> "本机 4 worker 测得 QPS XX 万、p99 延迟 XX μs，单机能撑 XX 万长连接。瓶颈在 XXX，已知通过 XXX 可继续优化。"
+> "本机 N worker 测得 QPS XX 万、p99 延迟 XX μs，单机能撑 XX 万长连接，每请求约 X 个 syscall。瓶颈在 XXX，已知通过 XXX 可继续优化。"
 
 ## §一.2　关键概念
 
@@ -54,54 +58,64 @@
 ```
 concurrency = throughput × avg_latency
 ```
-
-例：QPS = 10 万 + avg = 1ms → concurrency = 100。意思是任意时刻有 100 个请求在被服务。
-
+$\text{并发数} = \text{吞吐量} \times \text{平均延迟}$
 这个公式很重要：你只要测了两个，就能推出第三个。
 
 ### 饱和（saturation）
 
 资源使用率：CPU / 网卡带宽 / 内存 / fd 数 / TCP 缓冲区。压测时要监控**所有**资源，确认到底是谁先撑不住。
 
+### 资源效率（efficiency）
+
+光看"能跑多快"不够，还要看"每单位工作花了多少资源"。对一个 io_uring 网络库，两个最该秀的效率指标：
+
+- **每请求 syscall 数**：传统 epoll 模型每个请求至少 `read + write` 两次系统调用（外加 epoll_wait 摊销）；io_uring 的卖点是把多个 I/O 批进一次 `io_uring_enter`，理想下每请求趋近 **< 1 次 syscall**。用 `strace -c -p <pid>` 数：直方图里若几乎只有 `io_uring_enter`、`read/write` 寥寥，就坐实了。
+- **每连接内存**：单机能撑多少长连接，取决于每条连接的固定内存开销（连接对象 + 读写缓冲 + 内核 socket buffer）。量法：`(负载态 RSS − 空载 RSS) / 连接数`。这是 C100K/C1M 能力的根。
+
+这两个数把"快"翻译成"省"——同样的 QPS，syscall 少一半、每连接省几 KB，就是单机容量翻倍的来源。本项目用**测试 F 资源探针**（`bench_resource.sh`）量这两项。
+
 ## §一.3　负载模型：闭环 vs 开环
 
-### 闭环（closed loop）
+### 先纠正一个常见误解
 
-N 个客户端 worker，每个**收完一个请求才发下一个**。
+直觉里"闭环 = 等回应再发，开环 = 不等回应一直发"——**这个理解是错的**。
 
-```
-client → request → server
-            ↑
-            └── client wait until response
-            ↓
-client → next request → server
-```
+学术 / 工业界的定义是：**closed/open 指 feedback loop 是否接 server 反馈**，不是每条等不等回应。
 
-特点：
-- **自然限速**：服务端慢了，客户端被动等，不会无限增加并发
-- **缺点**：客户端慢导致服务端空闲，**实测延迟偏低**——客户端"自己等自己"那部分时间没记账
+- **闭环 (closed loop)**：客户端的发送决策**会被 server 状态影响**。server 慢 → 客户端自动慢下来。反馈通路存在。
+- **开环 (open loop)**：客户端按**外部固定时钟**发，**不管 server 状态**。server 慢死了客户端也照发不误。反馈通路打开（不接）。
 
-### 开环（open loop）
+"等不等每条回应"是另一个独立的轴。两个轴正交：
 
-客户端按**固定速率 R** 发，不管前一个有没有收到。
+|  | **等回应**（每条 RR） | **不等回应**（pipelined） |
+|---|---|---|
+| **闭环**（接 server 反馈）| 经典 RR 闭环：client `send → recv → send`，server 慢就自动等 | tcpkali 默认：流式发，socket buffer 满 `send()` 阻塞 → 也算反馈 |
+| **开环**（不接 server 反馈）| 几乎不存在（违反语义） | tcpkali `--message-rate R`：定时器照表发，buffer 满就丢/堆 |
 
-```
-t=0    t=10ms  t=20ms  t=30ms  ...
- ↓       ↓       ↓       ↓
-req     req     req     req     (即使上一个还没回，下一个照发)
-```
+三个具体场景：
 
-特点：
-- **真实模拟"用户按到达率请求"**
-- 能暴露**协调遗漏**（见 §一.4）
-- 缺点：服务端真挂了 / 慢了，请求会无限堆积，需要超时机制
+| 模型 | 典型 throughput @ 100 conn / 200μs RTT | CO 风险 | 用途 |
+|---|---|---|---|
+| 经典 RR 闭环（等+闭）| ≈ 500K req/s（受 RTT 限制：100 × 1/200μs）| **高**——server 卡顿期间 client 同样卡，慢请求被遗漏 | 测单连接延迟（小心 CO）|
+| tcpkali pipelined 闭环（不等+闭）| ≈ 50M msg/s（受 server 极限）| 低——buffer 自然吸收抖动 | 测系统**吞吐上限** |
+| tcpkali 限速开环（不等+开）| = 客户端设定的 offered load | 无 CO | 测**真实延迟 @ 固定负载** |
+
+### 关键洞察：throughput 数字大小 ≠ 闭环开环
+
+很多人以为"闭环数字小、开环数字大"。**错。**数字大小由**「是否让 client 饱和」**决定：
+
+- 闭环 pipelined **故意打满** → 数字 = server 极限（很大）
+- 限速开环 **故意不饱和** → 数字 = 你设的 offered load（你想多大就多大）
+
+要让开环测**吞吐上限**，得二分查找最大 `--message-rate`：升到 server p99 超 SLO 或开始 fail 为止，那个 rate 才是"**SLO 约束下的可持续开环吞吐**"。**本项目测试 B2 就是干这个**——扫一组 offered load，找 p99 离开地板的拐点。
 
 ### 选哪个？
 
-- 想知道"系统能跑多快"→ 闭环（让客户端尽量饱和服务端）
-- 想知道"延迟分布"或"服务质量"→ 开环（避免协调遗漏）
+- 想知道"系统极限能跑多快"→ **pipelined 闭环**（让 buffer 反压自己调速）
+- 想知道"业务负载下真实延迟" → **限速开环**（设固定 rate，CO 自动修正）
+- 想知道"满足 p99 < Xms 下能跑多少 req/s"→ **开环 + 二分**（throughput at SLO）
 
-本项目的 `echo_client.cc` 是**闭环**模型。原因：echo 没有合适的"自然到达率"，本来就是来一个回一个。但 §一.4 的陷阱要时刻警惕。
+本项目用 tcpkali 跑：测试 A/C 用 pipelined 闭环测吞吐/连接上限；测试 B 用闭环 + 开环对比（B1 演示 CO）再加开环负载扫描（B2 找拐点）。旧的 `legacy/echo_client.cc` 是经典 RR 闭环，CO 风险最高——所以才换 tcpkali。
 
 ## §一.4　Coordinated Omission（协调遗漏）：必须知道的陷阱
 
@@ -120,7 +134,7 @@ req     req     req     req     (即使上一个还没回，下一个照发)
 - 即使闭环采集，结果中"出现长尾"时要警惕——真实的尾延迟肯定更长
 - 用 HdrHistogram 配合"预期发送时间戳"自动修正
 
-本项目说明：归档的 `benchmark/legacy/echo_client.cc` 是闭环模型——保留作教学样本（CO 教学引用）。**当前压测改用 tcpkali**，原因见 §一.5。
+本项目说明：归档的 `benchmark/legacy/echo_client.cc` 是闭环模型——保留作教学样本（CO 教学引用）。**当前压测改用 tcpkali**，原因见 §一.5；**测试 B 同时跑闭环 + 开环两组数据，对比就是 CO 的直接演示**。
 
 ## §一.5　工具选型表
 
@@ -130,9 +144,10 @@ req     req     req     req     (即使上一个还没回，下一个照发)
 | `wrk` | HTTP | 闭环 | 中 | HTTP 通用 |
 | `wrk2` | HTTP | **开环** | 高（HdrHistogram） | 严肃的 HTTP 延迟测量 |
 | `fortio` | HTTP/gRPC | 开环 | 高 | Istio 团队产物，能画图 |
-| `tcpkali` | 任意 TCP | 闭/开环可切（`--message-rate`） | 中（p95/p99/p99.5） | **本项目选用** |
+| `tcpkali` | 任意 TCP | 默认 pipelined-closed；`--message-rate` 开环 | 中（p95/p99/p99.5） | **本项目选用** |
 | `netperf TCP_RR` | TCP（需 netserver） | — | 中 | 内核网络栈基准，无法测 user-space echo server |
-| `iperf3` | TCP/UDP | — | — | 测**带宽**，不测 QPS |
+| `iperf3` | TCP/UDP | — | — | 测**带宽底数**，不测 QPS |
+| `strace -c` | — | — | — | 数 **syscall 频率**（测试 F 资源效率） |
 | 自写客户端 | 任意 | 任意 | 任意 | 协议特殊 / 要求精确控制 |
 
 **本项目选 tcpkali**：
@@ -141,7 +156,7 @@ req     req     req     req     (即使上一个还没回，下一个照发)
 - C 实现、单二进制、apt 装得上（旧版从源码编）
 - 替代了原 `echo_client.cc`（已归档到 `legacy/`）；少 250 行维护成本
 
-旧自写客户端的"加分点"——讲清楚 CO 与开/闭环差异——同样可以基于 tcpkali 讲：因为现在我们的 `run_latency.sh` 同时跑闭环 + 开环两组数据，对比就是 CO 的直接演示。
+> tcpkali 延迟精度只到 0.1ms 粒度。所以报"p99 ≈ 0.2ms / 亚毫秒"比报"稳定 200μs"更站得住——0.2 是它的报告桶，真实值可能在 150–249μs。要 μs 级精确得上 HdrHistogram 类工具。
 
 ## §一.6　测试方法论
 
@@ -163,16 +178,28 @@ req     req     req     req     (即使上一个还没回，下一个照发)
 
 单次跑结果可能受瞬时干扰（系统其他进程、网络抖动）。至少跑 3 次，**取中位数**而不是平均值（中位数对极端值鲁棒）。
 
+### 要扫的轴，不是单点
+
+一个数字说明不了全貌。严肃 benchmark 都扫这几根轴（本项目对应测试见括号）：
+
+- **并发连接数**（测试 A / C）：吞吐和延迟随并发怎么变，找甜点和过载点
+- **消息大小**（测试 E）：小包（64-256B）瓶颈在 syscall/调度 → 看 msg/s；大包（4-16KB）瓶颈在拷贝/带宽 → 看 Gbps。muduo 经典 ping-pong 图就是 throughput vs block size
+- **offered load**（测试 B2）：固定连接数扫负载，找 p99 拐点 = SLO 约束下吞吐
+- **worker 数**（测试 D）：吞吐 vs 核数，看扩展线性度
+
 ### 隔离环境
 
 - 关浏览器、IDE、其它后台进程
 - CPU 频率调度设为 `performance`（不是 `powersave`）
 - 关闭可能的 turbo boost / SMT 影响（看场景）
-- 用 `taskset -c 0-3` 把进程钉到指定核
+- 用 `taskset` 把进程钉到指定核。16 vCPU server 建议留几个核给 NIC 软中断 / io_uring helper：
+  ```bash
+  taskset -c 0-11 ./build/example/echo_server_coro 18002 12   # server 占 0-11，留 12-15 给内核
+  ```
 
 ### 环境固化（必须记录）
 
-跑测时要把以下参数记下来，便于复现：
+跑测时要把以下参数记下来，便于复现（`run_all.sh` 自动写进 `env.txt`）：
 
 ```
 内核版本：     uname -r
@@ -190,7 +217,7 @@ liburing：     pkg-config --modversion liburing
 - **同机 loopback**：省去网络抖动，能跑出库的纯软件极限；但客户端和服务端**抢 CPU**，结果偏低
 - **跨机 LAN**：真实场景，受网卡 / 交换机限制；客户端独立机器结果更纯
 
-本项目用同机 loopback——简单 + 适合验证软件路径。生产化建议跨机重测。
+本项目正式数据用**跨机**（阿里云双机内网，client / server 各占一台 16 vCPU）。同机 loopback 仅作脚本流程验证。
 
 ## §一.7　结果解读：6 个常见 pattern
 
@@ -248,23 +275,24 @@ conn=10000: QPS = 80K  (严重)
 
 可用 `perf record` + 火焰图定位。
 
-### 5. 连接数到 10K 后大量 EMFILE
+### 5. 连接数到 64K 后大量失败
 
 ```
-conn=8000:  errors: 0
-conn=12000: errors: connect=4001
+conn=50000: errors: 0
+conn=65000: errors: connect=large
 ```
 
-**几乎肯定是 `ulimit -n` 没调**：
+单 client → 单 server:port 的并发连接上限 = 客户端可用端口数 ≈ 64K（4 元组里只有 client_port 在变）。先确认 `ulimit -n` 和端口范围：
 ```bash
-ulimit -n 200000
+ulimit -n 1000000
 sudo sysctl -w net.core.somaxconn=65535
-sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
+sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535"
 ```
+仍要破 64K → server 多端口或 client 多源 IP（见 REPRODUCE.md §6"破 64K 连接"）。
 
 ### 6. 服务端 CPU 没满但 QPS 上不去
 
-例如 4 worker 总 CPU 只占 60%，但 QPS 停在 300K。
+例如 8 worker 总 CPU 只占 60%，但 QPS 停在某值。
 
 **含义**：
 - **单线程瓶颈**：某个 worker 是热点（accept 全集中在 worker[0]？）
@@ -282,28 +310,30 @@ sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
 | `vmstat 1` | 系统级 CPU / IO / context switches | 看是否有大量 ctx switch（>10万/s 不正常） |
 | `iostat -x 1` | 磁盘 IOPS / await | 本项目主要看日志落盘 |
 | `ss -tan` | TCP 连接状态分布 | 看 ESTABLISHED / TIME_WAIT 数量 |
-| `netstat -s` | TCP 累计统计（retransmit / drop） | 看丢包率 |
-| `strace -c -p PID` | syscall 频率统计 | 验证 io_uring 是否真省了 syscall |
+| `netstat -s` | TCP 累计统计（retransmit / drop） | 看丢包率（netdev_max_backlog 不够会 drop） |
+| `strace -c -p PID` | syscall 频率统计 | **测试 F**：验证 io_uring 是否真省了 syscall |
 | `perf top -p PID` | 实时 CPU 热点函数 | 找瓶颈函数 |
 | `perf record -g + report` | 调用栈火焰图 | 深入分析 hot path |
 | `perf stat -d -p PID` | cache miss / IPC | 看 cache 局部性 |
 
-本项目内置 LOG_DEBUG（开 `-DCORO_NET_LOG_MIN_LEVEL_VAL=1` 重编译）可看每个 io_uring CQE 的处理细节，但压测时一般关。
+本项目内置 `monitor.sh`（时序 CPU/RSS/ctx-switch）+ `bench_resource.sh`（syscall 直方图 + 每连接内存）。LOG_DEBUG（开 `-DCORO_NET_LOG_MIN_LEVEL_VAL=1` 重编译）可看每个 io_uring CQE 的处理细节，但压测时一般关。
 
 ## §一.9　什么样的数据算"好"
 
-业界参考值（同机 loopback、TCP echo 64B / 4 worker）：
+业界参考值（同机 loopback、TCP echo 64B）：
 
 | 项目 | 优秀范围 | 备注 |
 |---|---|---|
-| 单机峰值 QPS | 300K - 1M | 4 worker 配置 |
+| 单机峰值 QPS | 300K - 1M+ | 取决于核数与消息大小 |
 | 每 worker QPS | 50K - 250K | 取决于 syscall 方案（同步/epoll/io_uring） |
 | p50 延迟 | < 200μs | loopback 上 |
 | p99 延迟 | < 1ms | 业界 "好" 的标准 |
 | p999 延迟 | < 5ms | 偶发尖刺合理范围 |
-| Worker 扩展性（1→4） | 线性 80%+ | shared-nothing 设计能拿到 |
-| Worker 扩展性（4→8） | 线性 50%+ | 多核共享资源开始竞争 |
-| 单机连接数 | 10K 容易，100K+ 要调内核 | `somaxconn / fs.file-max / tcp_mem` |
+| Worker 扩展性（1→半数核）| 线性 70%+ | shared-nothing 设计能拿到 |
+| Worker 扩展性（半数核→满核）| 线性 50%- | 多核共享资源 + 内核软中断抢核 |
+| 单机连接数 | 64K 是单 client 端口墙；破墙需多端口/多源 IP | `somaxconn / fs.file-max / ip_local_port_range` |
+| 每请求 syscall（io_uring）| 趋近 < 1 | epoll 模型约 2（read+write） |
+| 每连接内存 | 几 KB - 几十 KB | 决定 C100K/C1M 能力 |
 
 **对照知名项目**（仅参考，环境差异大）：
 - muduo: ~300K QPS / 4 worker (echo 64B)
@@ -315,113 +345,151 @@ sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
 
 # 第二部分　coro_net 实测报告
 
-## §二.1　测试环境
+> **状态：待测占位。** 下列表格的列头/schema 已就绪，数据格为 `待测`。
+> 在阿里云 16vCPU 64GiB × 2 上按 §三（REPRODUCE.md §11 playbook）跑完后，用
+> `benchmark/results/cloud/<ts>/` 的 CSV + `results/resource/<ts>/` 回填。
+
+## §二.1　测试环境（云上双机，主报告数据来源）
 
 | 项 | 值 |
 |---|---|
-| OS | Linux 6.6.114.1-microsoft-standard-WSL2 |
-| CPU | Intel Core i5-1035G1 @ 1.00GHz, 8 logical cores |
-| 内存 | ~3.9 GB |
-| 编译器 | g++ 13.3.0 |
-| 构建类型 | **Release / -O2** |
-| liburing | 2.5 |
-| 压测工具 | **tcpkali 0.4 (libev)**（替代了旧的自写 echo_client.cc） |
-| 拓扑 | 同机 loopback（client 和 server 抢 CPU） |
+| 实例 | 阿里云 ECS **16 vCPU / 64 GiB**（g7.4xlarge / c7.4xlarge）× 2，独立 server / client |
+| OS | Ubuntu LTS（内核 ≥ 6.x）|
+| 网络 | 同 VPC、同 zone 内网互通；iperf3 内网带宽 = `待测` Gbps |
+| 编译器 | g++ 13，**Release / -O2** |
+| liburing | `待测`（`pkg-config --modversion liburing`）|
+| 压测工具 | **tcpkali 0.4 (libev)**，client 自身 16 worker（= `$(nproc)`）；测试 F 用 strace |
+| sysctl | `tcp_tw_reuse=1`、`somaxconn=65535`、`ip_local_port_range=1024-65535`、`netdev_max_backlog=250000`、`ulimit -n 1000000` |
+| 拓扑 | 双机内网（client 与 server 各占一台 16 vCPU）|
+| 测试参数 | duration=60s，每点 3 轮取中位，msg=64B（含 latency-marker `@`）|
 
-⚠️ **本节是本机基线（小规模 + WSL2）**：仅作脚本流程 + 服务端基础可用性验证。**真实性能数字在云上跑**——见 [REPRODUCE.md](benchmark/REPRODUCE.md) 第 6 节双机流程。
+本节所有数据均来自 `benchmark/results/cloud/<ts>/`（云机 scp 回来的原始 CSV），可逐条核对。
 
-## §二.2　测试矩阵（当前本机基线参数）
+## §二.2　测试矩阵
 
-| 测试 | 维度 | 值 |
-|---|---|---|
-| A. QPS 扫描 | conn | **10, 100, 500**（云上扩到 1K/5K） |
-| B. 延迟分布 | mode | closed-loop vs open-loop（100 conn / 4 worker） |
-| C. 连接极限 | conn | **500, 1000**（云上扩到 1K → 20K） |
-| D. Worker 扩展 | workers | 1, 2, 4, 8（固定 100 conn） |
+| 测试 | 维度 | 值 | 侧 |
+|---|---|---|---|
+| A. QPS 扫描 | conn | 100, 1000, 5000, 10000（固定 12 worker）| client |
+| B1. CO 演示 | mode | closed-loop vs open-loop（100 conn）| client |
+| B2. 负载扫描 | offered load | 200K→5M（100 conn × rate 2K-50K），找 p99 拐点 | client |
+| C. 连接极限 | conn | 1K → 5K → 10K → 20K → 50K | client |
+| D. Worker 扩展 | workers | 1, 2, 4, 8, 16（固定 1000 conn）| client |
+| E. 消息大小 | msg_size | 64, 256, 1024, 4096, 16384 B（固定 12 worker / 1000 conn）| client |
+| F. 资源探针 | — | 每请求 syscall 数 + 每连接内存 | **server** |
 
-固定参数：消息大小 64B（含 marker `@`）、duration 10s、每点 2 轮取中位。云上推荐 `DURATION=60s ROUNDS=3`。
+> A/B/C/E 默认固定 12 worker（16 vCPU 上的暂定值）；测试 D 跑完确认真实 sweet spot 后回填。
 
-## §二.3　测试 A：QPS 扫描（本机基线，tcpkali pipelined throughput）
+## §二.3　测试 A：QPS / 吞吐扫描（pipelined throughput）
 
-| conn | msg/s | p95 (ms) | p99 (ms) | p99.5 (ms) | 备注 |
+> 数字含义：tcpkali 默认 pipelined 模式（流式发，marker 追踪每条消息）的总消息吞吐。**不是 RR QPS**，与旧 echo_client.cc 的 req/s 不同维度，不要直接对比。
+
+| conn | msg/s | bw (Gbps) | p95 (ms) | p99 (ms) | p99.5 (ms) | 备注 |
+|---|---|---|---|---|---|---|
+| 100 | 待测 | 待测 | 待测 | 待测 | 待测 | server 轻载 |
+| 1,000 | 待测 | 待测 | 待测 | 待测 | 待测 | server 中载 |
+| 5,000 | 待测 | 待测 | 待测 | 待测 | 待测 | server 接近饱和 |
+| 10,000 | 待测 | 待测 | 待测 | 待测 | 待测 | server 过载？ |
+
+**怎么读这张表**：看 msg/s 在哪个 conn 档见顶、p99 在哪个档跳到秒级（pipeline 队列堆积，非 server 慢）。真实业务延迟看 §二.4 开环数据。
+
+## §二.4　测试 B：闭环 vs 开环（CO 演示）+ 开环负载扫描（核心数据）
+
+> **术语对照**（详见 §一.3）：
+> - **closed** = tcpkali **pipelined 闭环**：不等回应连续发，buffer 满才 `send()` 阻塞（buffer 反压 = feedback loop）。**饱和测试**。
+> - **open** = tcpkali `--message-rate` **限速开环**：定时器照表发，不管 server 反馈。**故意不饱和**。
+> - 数字大小由"是否饱和"决定，不由闭环/开环决定。
+
+### B1　CO 现场演示（固定 conn=100 / 12 worker / msg=64B / 60s，3 轮取中位）
+
+| mode | msg/s | bw (Gbps) | p95 (ms) | p99 (ms) | p99.5 (ms) |
 |---|---|---|---|---|---|
-| 10 | 8.4M | 2.0 | 2.5 | 2.9 | 4 worker 没饱和 |
-| 100 | 5.4M | 41.7 | 45.3 | 46.5 | 流水线堆积导致延迟暴增 |
-| 500 | 失败 | — | — | — | WSL2 TIME-WAIT 端口耗尽（tcpkali 没建够连接） |
+| closed (pipelined 饱和) | 待测 | 待测 | 待测 | **待测** | 待测 |
+| open (限速 5000 msg/s/conn × 100 = 500K offered) | 待测 | 待测 | 待测 | **待测** | 待测 |
 
-**关键观察**：
-- "msg/s" 数字大是因为 **tcpkali 默认是 pipelined throughput 模式**——不等响应连续发，统计的是字节吞吐 ÷ 消息大小。**与旧 echo_client.cc 闭环 RR 的 291K QPS 不可直接对比**。
-- p99 在 conn 增加时显著上升，是流水线队列堆积，不是服务端处理慢——`run_latency.sh` 的 open-loop 模式才是真实延迟。
-- ≥500 conn 在本机失败是已知限制（见 [REPRODUCE.md §3](benchmark/REPRODUCE.md#3-系统调优强烈推荐不调-1000-连接测试会失败)），云上配 `tcp_tw_reuse=1` 后无此问题。
+**怎么读**：两个 p99 应差出数百倍。closed 的 p99 是消息在 socket buffer / 接收队列里排队的时间，不是 server 慢；open 的 p99 才是业务用户感受到的真实延迟。这就是 Coordinated Omission 的直接演示。
 
-## §二.4　测试 B：延迟分布（闭环 vs 开环对比 = CO 现场演示）
+### B2　开环负载扫描：找 SLO 拐点（固定 conn=100，扫 offered load）
 
-固定 conn=100 / 4 worker / msg=64B / duration=10s，每模式 2 轮取中位：
-
-| mode | msg/s | p95 (ms) | p99 (ms) | p99.5 (ms) |
+| offered load | 实际 msg/s | p95 (ms) | p99 (ms) | fails |
 |---|---|---|---|---|
-| closed（不限速，流水线打满） | 6.1M | 40.9 | **44.9** | 46.6 |
-| **open**（每连接 1000 msg/s 限速） | 100K | 1.0 | **2.0** | 2.6 |
+| 200K (rate 2000/conn) | 待测 | 待测 | 待测 | 待测 |
+| 500K (rate 5000/conn) | 待测 | 待测 | 待测 | 待测 |
+| 1M (rate 10000/conn) | 待测 | 待测 | 待测 | 待测 |
+| 2M (rate 20000/conn) | 待测 | 待测 | 待测 | 待测 |
+| 5M (rate 50000/conn) | 待测 | 待测 | 待测 | 待测 |
 
-**这就是 §一.4 讲的 Coordinated Omission 在数据上的展现**：
-- closed-loop 数字 100M+ msg/s 看着很爽，但 p99 = 45ms 是**流水线队头阻塞**，不是真实服务延迟
-- open-loop 在 100K msg/s 现实负载下，**真实 p99 < 2ms**——这才是用户感受到的延迟
-- 同一台机器，同一台 server，只是客户端发送策略不同，p99 差 **22 倍**
+**怎么读**：p99 在低负载下贴着地板（≈ 内网 RTT + 处理时间），到某档突然抬头——**那一档 offered load = SLO 约束下的可持续吞吐拐点**。这条曲线比单点"500K 下 p99=200μs"有说服力得多。想要"连接数 × 负载"二维矩阵：换 `CONN` 重跑本测试。
 
-云上同实验更稳，数字会显著降低（CPU 不被客户端抢）。
+## §二.5　测试 C：连接数极限
 
-## §二.5　测试 C：连接数极限（本机失败，等云上跑）
+固定 12 worker / msg=64B / duration=30s，单轮：
 
-| conn | 状态 |
-|---|---|
-| 500 | tcpkali 提前退出（TIME-WAIT 端口耗尽，WSL2 上 tcp_tw_reuse 行为受限） |
-| 1000+ | 未跑（同上） |
+| conn | msg/s | bw (Gbps) | p99 (ms) | connect / read / write errors |
+|---|---|---|---|---|
+| 1,000 | 待测 | 待测 | 待测 | 待测 |
+| 5,000 | 待测 | 待测 | 待测 | 待测 |
+| 10,000 | 待测 | 待测 | 待测 | 待测 |
+| 20,000 | 待测 | 待测 | 待测 | 待测 |
+| **50,000** | 待测 | 待测 | 待测 | 待测 |
 
-脚本已正确检测并停止（"tcpkali aborted early at c=500, ... hint: enable sysctl tcp_tw_reuse=1"）。云上 sysctl 调优后，预期可上 20K-50K。
+**这张表的卖点是错误列**——单机长连接通信 60 秒全程 0 错误能撑到哪个 conn 档。pipelined 模式下 p99 注定大（队列堆积），别拿来当延迟数。**注意 64K 端口墙**：单 client 默认上限 ≈ 64K，要更高见 REPRODUCE.md §6。
 
-## §二.6　测试 D：Worker 扩展性（本机受限）
+## §二.6　测试 D：Worker 扩展性
 
-固定 conn=100 / msg=64B，2 轮取中位：
+固定 conn=1000 / msg=64B / duration=60s，每个 worker 数 3 轮取中位（server 重启切换 worker 数）：
 
 | workers | msg/s | p95 (ms) | p99 (ms) | scale (vs 1w) |
 |---|---|---|---|---|
-| 1 | 5.85M | 33.8 | 108.6 | 1.00x (100%) |
-| 2 | 5.82M | 35.2 | 44.8 | 0.99x (50%) |
-| 4 | 4.85M | 37.3 | 42.4 | 0.83x (21%) |
-| 8 | 6.01M | 39.6 | 44.1 | 1.03x (13%) |
+| 1 | 待测 | 待测 | 待测 | 1.00x（基线）|
+| 2 | 待测 | 待测 | 待测 | 待测 |
+| 4 | 待测 | 待测 | 待测 | 待测 |
+| 8 | 待测 | 待测 | 待测 | 待测 |
+| 16 | 待测 | 待测 | 待测 | 待测 |
 
-**本机数据失真**：扩展比近乎平坦，原因不是服务端不会扩展，而是 **conn=100 + WSL2 loopback 已是带宽/调度瓶颈**——服务端 worker 数变化看不出影响。云上独立 client/server 机器、conn 提到 1000+ 会还原典型 4 worker sweet spot 模式。
+**怎么读**：找 QPS 高且 p99 没恶化的 worker 数 = **sweet spot**（16 vCPU 上预计 8-12）。16 worker（满核）时 server worker + io_uring helper + accept 抢满核，p99 通常恶化。**这张表定下来后，回填测试 A/B/C/E 的 `WORKERS` 默认值。**
 
-## §二.7　与旧基线的回归对比（防止改坏服务端）
+## §二.7　测试 E：消息大小扫描
 
-旧 echo_client.cc（闭环 RR，已归档到 `legacy/`）在同 WSL2 机器跑的数字（参考）：
+固定 12 worker / conn=1000 / duration=30s，3 轮取中位：
 
-| 指标 | 旧 echo_client（闭环 RR） | 当前 tcpkali（不同模型） |
+| msg_size | msg/s | bw (Gbps) | p99 (ms) | 主导瓶颈 |
+|---|---|---|---|---|
+| 64 B | 待测 | 待测 | 待测 | syscall / 调度（小包）|
+| 256 B | 待测 | 待测 | 待测 | 过渡 |
+| 1 KB | 待测 | 待测 | 待测 | 过渡 |
+| 4 KB | 待测 | 待测 | 待测 | 拷贝 / 带宽 |
+| 16 KB | 待测 | 待测 | 待测 | 网卡带宽（大包）|
+
+**怎么读**：小包 msg/s 高但 Gbps 低（瓶颈在 per-message 开销）；大包 msg/s 降但 Gbps 接近 iperf3 底数（瓶颈在带宽）。两端瓶颈不同，单一 64B 数字说明不了全貌。
+
+## §二.8　测试 F：资源效率（每请求 syscall + 每连接内存）
+
+server 端 `bench_resource.sh` 在稳定负载下采样：
+
+| 指标 | 值 | 解读 |
 |---|---|---|
-| 服务端实际处理能力 | 290K req/s @ 100 conn | 100K msg/s 开环 @ 100 conn / 1000 rate |
-| p99 (μs/ms) | 884 μs（闭环乐观下界） | 2 ms 开环（CO-fair） |
+| 主导 syscall | 待测（应为 `io_uring_enter`）| io_uring 批处理把 N 个 I/O 合一次 enter |
+| 每请求 syscall 数 | 待测（目标 < 1）| = strace total ÷ 窗口内 msg 数 |
+| `read`/`write` 占比 | 待测（应很低）| 若与 enter 同量级 = 没走 io_uring 路径 |
+| 空载 RSS | 待测 kB | server 起来不带连接时 |
+| 负载态 RSS @ N conn | 待测 kB | 施加 N 连接稳定后 |
+| **每连接内存** | 待测 bytes | = (负载 − 空载) RSS / 连接数 |
 
-两个数字测的不是同一件事，不能直接比。但都说明：**服务端无回归**——100 conn 下能稳定 ≥100K req/s 处理，p99 在 ms 级以下。
+**怎么读**：这是 io_uring 库最该秀的两个数。syscall 直方图几乎只有 `io_uring_enter` = 坐实了批处理；每连接内存越小，单机能撑的长连接越多（C100K/C1M 的根）。
 
-## §二.8　可直接念给面试官的数字（待云上更新）
+## §二.9　可直接念给面试官的数字（待跑完回填）
 
-本机基线（仅证可跑通 + 服务端无回归）：
+> 跑完用真实数填空。模板：
 
-> "用 tcpkali 跑 64B echo / 100 长连接：
-> - 开环 100K msg/s 实负载下 p99 = 2 ms
-> - 闭环 pipelined 6.1M msg/s 字节吞吐（演示 CO：p99 = 45ms 是队列堆积，非服务端慢）
-> - 旧自写客户端基线 291K req/s RR @ 100 conn / p99 = 0.88ms"
-
-云上 16 vCPU 双机基线（占位，等数据填）：
-
-> （等用户云上跑完 `DURATION=60s ROUNDS=3 bash benchmark/run_all.sh` 后填这表）
+> "coro_net 在阿里云 16vCPU 64GiB × 2 双机用 tcpkali（行业标准 TCP 压测工具）跑出来：
 >
-> | 指标 | 值 |
-> |---|---|
-> | 峰值 msg/s @ 1000 conn | TBD |
-> | 开环 100K rate p99 | TBD |
-> | 连接极限（0 错误） | TBD |
-> | 1→4 worker 扩展 | TBD |
+> - **真实业务负载 ___ offered load 下 p99 = ___ μs**（开环测试，修正 CO 后的真实延迟），p99 拐点在 ___ offered load
+> - **单机 ___ 长连接 60 秒零错误**（connect / read / write 全 0）
+> - **16 vCPU server sweet spot = ___ worker**：1→___ 扩展 ___x（___%），满核收益递减
+> - **每请求约 ___ 个 syscall**（io_uring 批处理，几乎只见 io_uring_enter），每连接约 ___ bytes 内存
+> - **管道峰值吞吐 ___ msg/s / ___ Gbps**（pipelined，闭环；非 RR QPS）
+>
+> 数据全部可复现，命令在 `benchmark/REPRODUCE.md`，原始 CSV 在 `benchmark/results/`。"
 
 ---
 
@@ -434,14 +502,17 @@ sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535"
 一句话上手：
 
 ```bash
-# 本机快验（10s × 1 轮）
-DURATION=10s ROUNDS=1 bash benchmark/run_all.sh
+# 本机快验（3s × 1 轮，验脚本流程，性能数无意义）
+DURATION=3s ROUNDS=1 bash benchmark/run_all.sh
 
-# 云上正式（60s × 3 轮 + tcp_tw_reuse=1 等调优）
+# 云上正式（60s × 3 轮 + sysctl 调优），跑 A/B/C/D/E 五类
 DURATION=60s ROUNDS=3 bash benchmark/run_all.sh
 
-# 双机
+# 双机（client 侧）
 SERVER_HOST=10.0.0.5 DURATION=60s ROUNDS=3 bash benchmark/run_all.sh
+
+# 测试 F 资源探针（server 侧，server 已在跑）
+./benchmark/bench_resource.sh <server_pid> 15 1000
 ```
 
 ### 目录结构
@@ -449,13 +520,15 @@ SERVER_HOST=10.0.0.5 DURATION=60s ROUNDS=3 bash benchmark/run_all.sh
 ```
 benchmark/
 ├── lib.sh                   公共函数（工具检查/启停 server/run_tcpkali/解析/CSV）
-├── run_all.sh               一键全跑 + 收 env.txt
+├── run_all.sh               一键全跑 A/B/C/D/E + 收 env.txt
 ├── run_qps.sh               测试 A：QPS 扫描
-├── run_latency.sh           测试 B：闭环 vs 开环延迟
+├── run_latency.sh           测试 B：CO 演示 + 开环负载扫描
 ├── run_conn_limit.sh        测试 C：连接数极限
 ├── run_worker_scaling.sh    测试 D：Worker 扩展性
+├── run_msg_size.sh          测试 E：消息大小扫描
+├── bench_resource.sh        测试 F：资源探针（server 端跑，syscall + 内存）
 ├── server_runner.sh         双机模式下在 server 机器上启停 server 的辅助脚本
-├── monitor.sh               跑测期间监控服务端 CPU/MEM/ctx-switch
+├── monitor.sh               跑测期间监控服务端 CPU/MEM/ctx-switch（时序）
 ├── REPRODUCE.md             复现教程（云阶段照这一份做就行）
 ├── legacy/                  归档的旧手写客户端 echo_client.cc + common.sh
 └── results/                 每次跑产出独立子目录（CSV + raw log + env.txt）

@@ -2,13 +2,16 @@
 # =============================================================================
 # 测试 D：Worker 扩展性
 # =============================================================================
-# 固定 conn=100 / msg=64B，扫 workers={1,2,4,8}
+# 固定 conn=1000 / msg=64B，扫 workers={1,2,4,8,16}
 # 每个 worker 数下脚本重启 server；远程模式则提示用户手动重启
+# 16 vCPU server 上扫到 16（= 满核）。sweet spot 通常在 ~半数核（8-12），
+# 16 worker 时 server worker + io_uring helper + accept 抢满核，p99 可能恶化。
+# 这张表跑完即可回填测试 A/B/C 的 WORKERS 默认值。
 # =============================================================================
 source "$(dirname "$0")/lib.sh"
 
-CONN="${CONN:-100}"
-WORKERS_LIST="${WORKERS_LIST:-1 2 4 8}"
+CONN="${CONN:-1000}"
+WORKERS_LIST="${WORKERS_LIST:-1 2 4 8 16}"
 
 print_mode_banner
 echo "[test] D: worker scaling  conn=$CONN workers={$WORKERS_LIST}"

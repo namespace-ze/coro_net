@@ -2,13 +2,15 @@
 # =============================================================================
 # 测试 A：QPS 扫描
 # =============================================================================
-# 固定 workers=4 / msg=64B，扫 connections={10,100,1000,5000}
+# 固定 workers=12 / msg=64B，扫 connections={100,1000,5000,10000}
 # 每档跑 $ROUNDS 轮，输出 CSV + raw log
+# 默认 workers=12 是 16 vCPU 上的暂定值；待测试 D（worker 扫描 1→16）确认真实
+# sweet spot 后回填。client 与 server 各占一台 16 vCPU 时此值最稳。
 # =============================================================================
 source "$(dirname "$0")/lib.sh"
 
-WORKERS="${WORKERS:-4}"
-CONNECTIONS_LIST="${CONNECTIONS_LIST:-10 100 1000 5000}"
+WORKERS="${WORKERS:-12}"
+CONNECTIONS_LIST="${CONNECTIONS_LIST:-100 1000 5000 10000}"
 
 print_mode_banner
 echo "[test] A: QPS scan  workers=$WORKERS conns={$CONNECTIONS_LIST}"

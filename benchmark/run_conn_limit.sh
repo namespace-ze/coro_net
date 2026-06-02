@@ -2,13 +2,19 @@
 # =============================================================================
 # 测试 C：连接数极限
 # =============================================================================
-# workers=4 / msg=64B，c 从 1k 递增到失败或 QPS 塌缩（>10% connect failures 就停）
-# 注意：本机 ip_local_port_range 决定可用客户端端口（默认约 28K）
+# workers=12 / msg=64B，c 从 1k 递增到失败或 QPS 塌缩（>10% connect failures 就停）
+#
+# 单 client → 单 server:port 的并发连接上限 ≈ 本地 ip_local_port_range 大小：
+# 4 元组 (client_ip, client_port, server_ip, server_port) 中只有 client_port 在变，
+# 范围 1024-65535 ≈ 64K，故 50K 是安全上界、64K 是硬墙。要破 64K 需要：
+#   - server 监听多个端口，client 分摊连过去，或
+#   - client 多源 IP（tcpkali --source-ip a,b,c）扩大 4 元组空间。
+# 二者属进阶玩法，不进默认脚本；做法见 REPRODUCE.md。
 # =============================================================================
 source "$(dirname "$0")/lib.sh"
 
-WORKERS="${WORKERS:-4}"
-CONN_LIST="${CONN_LIST:-1000 2000 5000 10000 20000}"
+WORKERS="${WORKERS:-12}"
+CONN_LIST="${CONN_LIST:-1000 5000 10000 20000 50000}"
 DURATION="${DURATION:-10s}"  # 大连接数下短时即可观察
 
 print_mode_banner
