@@ -21,16 +21,42 @@ static void on_signal(int) {
     if (g_server) g_server->stop();
 }
 
+// 读 unsigned 环境变量（缺省/非法 → dflt）。用于压测时免重编调优。
+static unsigned env_u(const char* key, unsigned dflt) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return dflt;
+    char* end = nullptr;
+    unsigned long r = std::strtoul(v, &end, 10);
+    return (end && *end == '\0') ? static_cast<unsigned>(r) : dflt;
+}
+
 int main(int argc, char** argv) {
     uint16_t port = (argc > 1) ? static_cast<uint16_t>(std::stoi(argv[1])) : 8002;
     int      nthr = (argc > 2) ? std::stoi(argv[2]) : 4;
 
+    // 调优旋钮（环境变量，压测时无需重编；详见 benchmark/REPRODUCE.md §3.1）：
+    //   CORO_SQPOLL_THREADS：SQPOLL 轮询线程数 M（0=关闭 SQPOLL，默认 4）
+    //   CORO_FIXED_BUFFERS ：1=启用固定注册缓冲池（默认 1），0=关闭走堆 Buffer
+    //   CORO_BUF_CAPACITY  ：每 worker slot 数（0=默认 kDefaultBufCapacity；
+    //                        须 ≥ ceil(目标并发/workers) 且 ≤ 16384）
+    //   CORO_BUF_SLOT_SIZE ：每 slot 字节（默认 16384）
+    const unsigned sqpoll_m = env_u("CORO_SQPOLL_THREADS", 4);
+    const bool     fixed    = env_u("CORO_FIXED_BUFFERS", 1) != 0;
+    const unsigned buf_cap  = env_u("CORO_BUF_CAPACITY", 0);
+    const unsigned slot_sz  = env_u("CORO_BUF_SLOT_SIZE", 16 * 1024);
+
     coro_net::init_logger("echo_server_coro");
-    LOG_INFO << "listen :" << port << " workers=" << nthr;
+    LOG_INFO << "listen :" << port << " workers=" << nthr
+             << " sqpoll_threads=" << sqpoll_m
+             << " fixed_buffers=" << (fixed ? 1 : 0)
+             << " buf_capacity=" << buf_cap << " slot_size=" << slot_sz;
 
     coro_net::TcpServer server(
         coro_net::InetAddress{port, "0.0.0.0"},
         static_cast<size_t>(nthr));
+
+    server.set_sqpoll_threads(sqpoll_m);
+    server.set_fixed_buffers(fixed, slot_sz, buf_cap);
 
     server.set_handler([](coro_net::TcpConnectionPtr conn)
                        -> coro_net::Task<void> {

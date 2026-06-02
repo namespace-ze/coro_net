@@ -50,6 +50,11 @@ ulimit -n 1000000                     # 当前 shell
 echo '* soft nofile 1000000' | sudo tee -a /etc/security/limits.conf
 echo '* hard nofile 1000000' | sudo tee -a /etc/security/limits.conf
 
+# 1b. 锁定内存上限（固定注册缓冲池 pin 内存用，详见 §3.1）
+ulimit -l unlimited                   # 当前 shell（容器/云机一般可直接设）
+echo '* soft memlock unlimited' | sudo tee -a /etc/security/limits.conf
+echo '* hard memlock unlimited' | sudo tee -a /etc/security/limits.conf
+
 # 2. 内核 TCP 参数
 sudo sysctl -w net.core.somaxconn=65535 \
               net.ipv4.tcp_max_syn_backlog=65535 \
@@ -62,6 +67,7 @@ sudo sysctl -w net.core.somaxconn=65535 \
 
 # 3. 验证
 ulimit -n         # 应为 1000000
+ulimit -l         # 应为 unlimited（或 ≥ 缓冲池总字节，见 §3.1）
 sysctl net.ipv4.tcp_tw_reuse   # 应为 1
 sysctl net.ipv4.ip_local_port_range   # 应为 1024  65535
 ```
@@ -79,6 +85,88 @@ sysctl net.ipv4.ip_local_port_range   # 应为 1024  65535
 > **云上额外检查 `nf_conntrack`**：若安全组/iptables 启用了连接跟踪，高连接数会撞
 > `nf_conntrack_max`。查 `sysctl net.netfilter.nf_conntrack_max`（没这个 key 说明
 > 没加载 conntrack，可忽略）；撞了就 `sudo sysctl -w net.netfilter.nf_conntrack_max=1000000`。
+
+---
+
+## 3.1 io_uring 优化前期准备（SQPOLL / SO_REUSEPORT / 固定注册缓冲池）
+
+server 端启用了三项高并发优化，**前两项零配置自动生效**，第三项（固定缓冲池）
+**依赖 `RLIMIT_MEMLOCK`，不调会静默回退**——必须在压测前确认。
+
+### 三项优化与各自前提
+
+| 优化 | 默认 | 前提 / 注意 | 不满足时的行为 |
+|---|---|---|---|
+| **SO_REUSEPORT 每 worker 本地 accept** | 始终开 | 无（内核四元组哈希分流） | — |
+| **SQPOLL（M 个轮询线程，ATTACH_WQ 分组）** | M=4 | 内核 ≥ 5.13 非特权可用（云机 Ubuntu 22/24 均满足） | 自动回退非 SQPOLL，日志打 WARN |
+| **固定注册缓冲池（read_fixed/write_fixed 零拷贝）** | 开，slot=16KB，cap=4096/worker | **`memlock` ≥ `cap × slot × workers`**；单 ring cap ≤ 16384 | 注册失败/池满 → 回退堆 Buffer（仍正确，但少了零拷贝） |
+
+### 关键一：memlock 必须够大（否则固定缓冲池回退）
+
+固定缓冲是 **pin 住的内存**，计入 `RLIMIT_MEMLOCK`。整进程需要的字节数：
+
+```
+需要的 memlock ≈ CORO_BUF_CAPACITY × CORO_BUF_SLOT_SIZE × workers
+例：cap=5000, slot=16KB, workers=12  →  5000 × 16384 × 12 ≈ 960 MB
+```
+
+§3 已把 `memlock` 设为 `unlimited`（推荐）。若环境不允许 unlimited，则手动设到
+上式的 ~1.5 倍。**验证**：`ulimit -l` 返回 `unlimited` 或足够大的字节数。
+WSL2 本机默认仅 64KB → 固定缓冲池必回退（本机只做功能验证，不在此跑固定缓冲压测）。
+
+### 关键二：缓冲池容量要覆盖目标并发
+
+`cap` 是**每 worker** 的 slot 数，须满足 `cap ≥ ceil(目标并发连接 / workers)` 且 `≤ 16384`。
+默认 `cap=4096` 在 12 worker 下只够 ~49K 连接（`4096×12`），跑 **50K 档会有约 1K 连接
+回退**。要让 50K 全程零拷贝，压测 50K 前把 `cap` 调大：
+
+```
+50K conn / 12 worker → ceil = 4167 → 取 5000（留余量，5000×12=60K ≥ 50K）
+```
+
+### 调优旋钮（环境变量，无需重编）
+
+`echo_server_coro` / `server_runner.sh` 读以下环境变量（`server_runner.sh` 用 `exec`
+继承环境，直接在它前面带上即可）：
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `CORO_SQPOLL_THREADS` | `4` | SQPOLL 轮询线程数 M；`0`=关闭 SQPOLL |
+| `CORO_FIXED_BUFFERS` | `1` | `1`=启用固定缓冲池；`0`=关闭（强制走堆 Buffer，用于对照） |
+| `CORO_BUF_CAPACITY` | `4096` | 每 worker slot 数（见关键二） |
+| `CORO_BUF_SLOT_SIZE` | `16384` | 每 slot 字节（消息更大时调大；同时放大 memlock 需求） |
+
+```bash
+# server 机器：12 worker，cap 调到 5000 以覆盖 50K 档
+CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12
+
+# 想做"开/关固定缓冲池"对照压测：
+CORO_FIXED_BUFFERS=0 ./benchmark/server_runner.sh 12   # baseline（堆 Buffer）
+CORO_FIXED_BUFFERS=1 CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12
+```
+
+### 启动后必看：确认优化都生效
+
+server 启动后用下面三条快速核对（**任何一条不符就别开始压测**）：
+
+```bash
+PORT=18002
+PID=$(pgrep -f "echo_server_coro $PORT")
+
+# 1) SO_REUSEPORT：应看到 = workers 个 listen socket 共用同端口
+ss -lntH "sport = :$PORT" | wc -l            # 期望 == workers 数
+
+# 2) SQPOLL：应看到 = M 个 iou-sqp 内核线程（期望 == CORO_SQPOLL_THREADS，默认 4）
+cat /proc/$PID/task/*/comm 2>/dev/null | grep -c iou-sqp
+#   注意：ps -eLf | grep iou-sqp 会误匹配命令行自身，用上面的 /proc 法更准
+
+# 3) 固定缓冲池：日志里每个 worker 都应是 "registered buffer pool"，
+#    不应出现 "register_buffers failed ... RLIMIT_MEMLOCK too low"
+grep -E "registered buffer pool|register_buffers failed" echo_server_coro.*.log
+```
+
+> 若 (3) 出现 `register_buffers failed (errno=12 ...)` → memlock 不够，回 §3 设
+> `ulimit -l unlimited` 后**重启 server**。errno=12 是 ENOMEM（被 memlock 限住）。
 
 ---
 
@@ -402,6 +490,7 @@ cmake --build build -j
 
 # (3) ulimit + sysctl（§3 全套）
 ulimit -n 1000000
+ulimit -l unlimited                # 固定缓冲池 pin 内存用（§3.1）；server 机器必做
 sudo sysctl -w net.core.somaxconn=65535 \
               net.ipv4.tcp_max_syn_backlog=65535 \
               net.ipv4.ip_local_port_range="1024 65535" \
@@ -413,13 +502,16 @@ sudo sysctl -w net.core.somaxconn=65535 \
 
 # (4) 验证
 ulimit -n                          # → 1000000
+ulimit -l                          # → unlimited（server 机器；不足则固定缓冲池回退）
 sysctl net.ipv4.tcp_tw_reuse       # → net.ipv4.tcp_tw_reuse = 1
 sysctl net.ipv4.ip_local_port_range # → 1024  65535
 tcpkali --version                  # → 0.4+
 ls -l build/example/echo_server_coro   # 存在
 ```
 
-四项任何一项不对，先排查；不要带病压测。
+以上任何一项不对，先排查；不要带病压测。
+> `ulimit -l unlimited` 仅 server 机器关键（client 不跑固定缓冲池）。设不上
+> （受 limits.conf 限制）时改用 §3 的 limits.conf 持久化后**重新登录**。
 
 ---
 
@@ -448,8 +540,13 @@ iperf3 -c 172.16.0.5 -t 10 -P 4
 ### Step 3：测试 A / B / C / E（固定 12 worker，~40 分钟）
 
 > **关键**：默认 `CONNECT_RATE=1000` 是阿里云 SLB 安全值（见 §8）。**云上不要改**。conn ≥ 5000 时 `DURATION` 必须 ≥ 60s（爬坡 10s + 实测都要时间）。
+>
+> **缓冲池容量**：这一组含 50K 连接档（测试 C），默认 `cap=4096` 在 12 worker 下
+> 只够 ~49K，会有约 1K 连接回退堆 Buffer。要 50K 全程零拷贝，**启动 server 时带
+> `CORO_BUF_CAPACITY=5000`**（见 §3.1）：`CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12`。
+> 这四个测试共用这一个 server，所以一次设好即可。启动后按 §3.1 末尾三条核对优化生效。
 
-**两个 SSH 窗口对照操作**：
+**两个 SSH 窗口对照操作**（server 启动命令改为 `CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12`）：
 
 ```text
 ╭─── SSH 1: Server 机器 ────╮   ╭─── SSH 2: Client 机器 ──────────────╮
