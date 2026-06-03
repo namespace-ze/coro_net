@@ -99,6 +99,7 @@ struct SchedulerConfig {
     bool     sqpoll = false;             // 启用 IORING_SETUP_SQPOLL
     unsigned sq_thread_idle_ms = 1000;   // 轮询线程空闲多久（ms）后休眠
     int      wq_fd = -1;                 // >=0：ATTACH_WQ 复用该 ring 的轮询线程
+    int      sq_thread_cpu = -1;         // >=0：把本 ring 的 SQPOLL 线程钉到该核
 
     // --- 固定注册缓冲池（默认关闭；由 TcpServer 按 set_fixed_buffers 开启）---
     bool     use_fixed_buffers = false;  // 注册固定缓冲池（io_uring_register_buffers）

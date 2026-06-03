@@ -77,6 +77,10 @@ public:
     // 轮询 kthread（默认 4）。详见 SchedulerPool / IoUring。
     void set_sqpoll_threads(unsigned m) { sqpoll_threads_ = m; }
 
+    // 把 M 个 SQPOLL 轮询线程钉到指定核（第 g 个轮询线程 → cpus[g]）。
+    // 空 = 不钉核。给轮询线程专属核（并避开网络 softirq 核）可消除吞吐抖动。
+    void set_sqpoll_cpus(std::vector<int> cpus) { sqpoll_cpus_ = std::move(cpus); }
+
     // 固定注册缓冲池：on=true 时每 worker 注册 capacity_per_worker 个
     // slot_size 字节的固定缓冲，连接用 read_fixed/write_fixed 零拷贝收发。
     // capacity_per_worker=0 用默认（kDefaultBufCapacity）。
@@ -113,6 +117,7 @@ private:
 
     // 调优参数（start() 前设置）
     unsigned sqpoll_threads_ = 4;           // M（0=不开 SQPOLL）
+    std::vector<int> sqpoll_cpus_;          // SQPOLL 轮询线程钉核（空=不钉）
     bool     use_fixed_buffers_ = true;
     unsigned buf_slot_size_ = 16 * 1024;
     unsigned buf_pool_capacity_ = 0;        // 0=用 kDefaultBufCapacity

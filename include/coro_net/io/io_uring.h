@@ -69,6 +69,8 @@ struct IoUringParams {
     bool     sqpoll = false;          // 是否启用 IORING_SETUP_SQPOLL
     unsigned sq_thread_idle_ms = 1000;// 轮询线程空闲多久（ms）后休眠
     int      wq_fd = -1;              // >=0：ATTACH_WQ 复用该 ring 的轮询线程
+    int      sq_thread_cpu = -1;      // >=0：把本 ring 的 SQPOLL 线程钉到该核
+                                      //      （IORING_SETUP_SQ_AFF；仅组首 leader 需设）
 };
 
 // -----------------------------------------------------------------------------
@@ -95,14 +97,20 @@ public:
     // 不启用 SINGLE_ISSUER：见文件头注释（ring 由主线程构造、worker 线程提交）。
     explicit IoUring(const IoUringParams& p) {
         unsigned full = IORING_SETUP_COOP_TASKRUN;
-        if (p.sqpoll)       full |= IORING_SETUP_SQPOLL;
-        if (p.wq_fd >= 0)   full |= IORING_SETUP_ATTACH_WQ;
+        if (p.sqpoll)                            full |= IORING_SETUP_SQPOLL;
+        if (p.wq_fd >= 0)                        full |= IORING_SETUP_ATTACH_WQ;
+        if (p.sqpoll && p.sq_thread_cpu >= 0)    full |= IORING_SETUP_SQ_AFF;
 
+        // 候选按"保留最多有用特性"递减；关键是 SQ_AFF（仅钉核优化）要在 SQPOLL
+        // 之前被剥离——否则内核拒绝 SQ_AFF 会把 SQPOLL 一起丢掉。
         std::vector<unsigned> candidates;
-        candidates.push_back(full);
+        candidates.push_back(full);                                   // 全开
+        if (full & IORING_SETUP_SQ_AFF)
+            candidates.push_back(full & ~IORING_SETUP_SQ_AFF);        // 丢钉核，保 SQPOLL
         if (full & IORING_SETUP_COOP_TASKRUN)
-            candidates.push_back(full & ~IORING_SETUP_COOP_TASKRUN);
-        // 退掉 SQPOLL 也必须退掉 ATTACH_WQ（它依赖共享的 SQPOLL 组）
+            candidates.push_back(full & ~IORING_SETUP_SQ_AFF
+                                      & ~IORING_SETUP_COOP_TASKRUN);  // 再丢 COOP_TASKRUN
+        // 最后退掉 SQPOLL（连带 ATTACH_WQ / SQ_AFF，它们都依赖 SQPOLL）
         candidates.push_back(IORING_SETUP_COOP_TASKRUN);
         candidates.push_back(0u);
 
@@ -114,6 +122,8 @@ public:
                 params.sq_thread_idle = p.sq_thread_idle_ms;
             if (flags & IORING_SETUP_ATTACH_WQ)
                 params.wq_fd = static_cast<unsigned>(p.wq_fd);
+            if (flags & IORING_SETUP_SQ_AFF)
+                params.sq_thread_cpu = static_cast<__u32>(p.sq_thread_cpu);
 
             ret = io_uring_queue_init_params(p.entries, &ring_, &params);
             if (ret == 0) {

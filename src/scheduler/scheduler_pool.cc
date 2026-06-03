@@ -10,7 +10,8 @@
 
 namespace coro_net {
 
-SchedulerPool::SchedulerPool(size_t n, SchedulerConfig base, unsigned M) {
+SchedulerPool::SchedulerPool(size_t n, SchedulerConfig base, unsigned M,
+                             std::vector<int> sqpoll_cpus) {
     schedulers_.reserve(n);
 
     // 是否做 SQPOLL 分组：把 n 个 ring 分成 M 组，组首自建轮询线程，
@@ -21,10 +22,15 @@ SchedulerPool::SchedulerPool(size_t n, SchedulerConfig base, unsigned M) {
     for (size_t i = 0; i < n; ++i) {
         SchedulerConfig cfg = base;
         cfg.wq_fd = -1;
+        cfg.sq_thread_cpu = -1;
         if (grouping) {
-            const size_t leader = (i / gsz) * gsz;       // 本组组首下标
-            if (i != leader) {
-                // 组首已先构造，复用其轮询线程。
+            const size_t g = i / gsz;                    // 本 ring 所属组
+            const size_t leader = g * gsz;               // 组首下标
+            if (i == leader) {
+                // 组首：自建轮询线程，可钉核（sqpoll_cpus[g]）。
+                if (g < sqpoll_cpus.size()) cfg.sq_thread_cpu = sqpoll_cpus[g];
+            } else {
+                // 组员：复用组首的轮询线程（不再单独钉核）。
                 cfg.wq_fd = schedulers_[leader]->ring().ring_fd();
             }
         }
@@ -33,7 +39,9 @@ SchedulerPool::SchedulerPool(size_t n, SchedulerConfig base, unsigned M) {
 
     if (grouping) {
         LOG_INFO << "SchedulerPool: " << n << " rings, " << M
-                 << " SQPOLL poller thread(s) (group size " << gsz << ")";
+                 << " SQPOLL poller thread(s) (group size " << gsz << ")"
+                 << (sqpoll_cpus.empty() ? " [pollers unpinned]"
+                                         : " [pollers pinned]");
     }
 }
 

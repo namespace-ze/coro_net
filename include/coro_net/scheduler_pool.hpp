@@ -36,8 +36,12 @@ public:
     //                 把 n 个 ring 分成 M 组，每组组首 ring 自建轮询线程，
     //                 组内其余 ring 经 ATTACH_WQ 复用组首的轮询线程
     //                 （M 个 kthread 服务 N 个 ring，M≤N）。M=0 等价每 ring 一个线程。
+    // sqpoll_cpus  ：把第 g 个组首的 SQPOLL 线程钉到 sqpoll_cpus[g] 核
+    //                （IORING_SETUP_SQ_AFF）。空 = 不钉核（交调度器）。
+    //                给轮询线程专属核可消除"和网络 softirq 抢核"导致的吞吐抖动。
     explicit SchedulerPool(size_t n, SchedulerConfig base = {},
-                           unsigned sqpoll_threads = 0);
+                           unsigned sqpoll_threads = 0,
+                           std::vector<int> sqpoll_cpus = {});
     ~SchedulerPool();
 
     SchedulerPool(const SchedulerPool&) = delete;

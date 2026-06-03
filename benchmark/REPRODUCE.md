@@ -132,6 +132,7 @@ WSL2 本机默认仅 64KB → 固定缓冲池必回退（本机只做功能验�
 | 变量 | 默认 | 含义 |
 |---|---|---|
 | `CORO_SQPOLL_THREADS` | `4` | SQPOLL 轮询线程数 M；`0`=关闭 SQPOLL |
+| `CORO_SQPOLL_CPUS` | 空（不钉核） | 把第 g 个轮询线程钉到指定核，如 `"13,14,15"`（见关键三） |
 | `CORO_FIXED_BUFFERS` | `1` | `1`=启用固定缓冲池；`0`=关闭（强制走堆 Buffer，用于对照） |
 | `CORO_BUF_CAPACITY` | `4096` | 每 worker slot 数（见关键二） |
 | `CORO_BUF_SLOT_SIZE` | `16384` | 每 slot 字节（消息更大时调大；同时放大 memlock 需求） |
@@ -144,6 +145,34 @@ CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12
 CORO_FIXED_BUFFERS=0 ./benchmark/server_runner.sh 12   # baseline（堆 Buffer）
 CORO_FIXED_BUFFERS=1 CORO_BUF_CAPACITY=5000 ./benchmark/server_runner.sh 12
 ```
+
+### 关键三：高连接数下给 SQPOLL 线程钉核（治吞吐抖动）
+
+SQPOLL 线程不钉核时，调度器可能把它丢到正在跑网络 softirq 的核上抢核，导致
+**同一配置两次跑吞吐差一倍（如 50M / 24M 之间双稳态），且塌下去不恢复**。根治办法是
+给每个轮询线程一个**专属核，并避开网络 softirq 的核**：
+
+```bash
+# 1) 先看 softirq 落在哪些核（压测时另开一窗口）
+mpstat -P ALL 1        # 看 %soft 高的核号（云上常集中在低编号核）
+
+# 2) 把 M 个轮询线程钉到避开 softirq 的核（例：16C 机器，softirq 在 0-3，则用高位核）
+CORO_SQPOLL_THREADS=3 CORO_SQPOLL_CPUS="13,14,15" CORO_BUF_CAPACITY=5000 \
+  ./benchmark/server_runner.sh 12
+
+# 3) 验证真的钉上了（Cpus_allowed_list 应是单个核，不是 0-15）
+PID=$(pgrep -x echo_server_cor)
+for t in /proc/$PID/task/*/; do c=$(cat $t/comm); case $c in iou-sqp*)
+  echo "$c -> $(awk '/Cpus_allowed_list/{print $2}' $t/status)"; esac; done
+```
+
+> **判据**：第 3 步每个 `iou-sqp` 的 `Cpus_allowed_list` 应是**单个核号**（如 `13`）。
+> 若显示 `0-15`（全核）说明没钉上——**WSL2 内核接受 `SQ_AFF` 标志但不真正绑核**
+> （本机就是如此），所以钉核只能在云上的标准内核验证；不钉核(`CORO_SQPOLL_CPUS` 留空)是安全默认。
+>
+> 钉核后重测 M=3/QPS，预期方差消失、稳定摸到网卡墙；并能算出"打满网卡的最小轮询核数"。
+> 进阶：再用 `taskset` 把 worker 线程钉到**其余**核、用 RPS/`set_irq_affinity` 把
+> softirq 摊到固定一段核，做到"worker / 轮询 / softirq 三者物理隔离"。
 
 ### 启动后必看：确认优化都生效
 
@@ -533,6 +562,7 @@ iperf3 -c 172.16.0.5 -t 10 -P 4
 - < 1 Gbps：检查实例族是否真是 g7/c7（不是 t6/s6）、安全组是否放行、是否同 zone
 - ≥ 10 Gbps：万事俱备。**记下这个数**——测试 A/E 的 Gbps 接近它就是撞了网卡而非 server 上限
 
+测试出为26.3 Gbits/sec  
 测完 Ctrl-C 停掉 iperf3 server。
 
 ---

@@ -14,6 +14,8 @@
 #include <csignal>
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <unistd.h>
 
 static coro_net::TcpServer* g_server = nullptr;
 
@@ -28,6 +30,27 @@ static unsigned env_u(const char* key, unsigned dflt) {
     char* end = nullptr;
     unsigned long r = std::strtoul(v, &end, 10);
     return (end && *end == '\0') ? static_cast<unsigned>(r) : dflt;
+}
+
+// 解析 SQPOLL 轮询线程钉核列表（钉核是 *opt-in*）：
+//   CORO_SQPOLL_CPUS="13,14,15" → {13,14,15}（第 g 个轮询线程钉到第 g 个核）
+//   未设 / "off" / "none"        → 不钉核（默认，交调度器；最稳妥）
+// 说明：是否钉核、钉到哪些核高度依赖机器拓扑（要避开网络 softirq 核），
+// 故不做"自动钉核"默认值——先 mpstat 看 softirq 落核，再显式指定。
+static std::vector<int> sqpoll_cpus(unsigned /*m*/) {
+    const char* v = std::getenv("CORO_SQPOLL_CPUS");
+    if (!v || !*v) return {};
+    if (std::string(v) == "off" || std::string(v) == "none") return {};
+    std::vector<int> cpus;
+    const char* p = v;
+    while (*p) {
+        char* end = nullptr;
+        long c = std::strtol(p, &end, 10);
+        if (end == p) break;
+        if (c >= 0) cpus.push_back(static_cast<int>(c));
+        p = (*end == ',') ? end + 1 : end;
+    }
+    return cpus;
 }
 
 int main(int argc, char** argv) {
@@ -45,17 +68,25 @@ int main(int argc, char** argv) {
     const unsigned buf_cap  = env_u("CORO_BUF_CAPACITY", 0);
     const unsigned slot_sz  = env_u("CORO_BUF_SLOT_SIZE", 16 * 1024);
 
+    const std::vector<int> poll_cpus = sqpoll_cpus(sqpoll_m);
+
     coro_net::init_logger("echo_server_coro");
-    LOG_INFO << "listen :" << port << " workers=" << nthr
-             << " sqpoll_threads=" << sqpoll_m
-             << " fixed_buffers=" << (fixed ? 1 : 0)
-             << " buf_capacity=" << buf_cap << " slot_size=" << slot_sz;
+    {
+        std::string cpus_str;
+        for (int c : poll_cpus) cpus_str += std::to_string(c) + " ";
+        LOG_INFO << "listen :" << port << " workers=" << nthr
+                 << " sqpoll_threads=" << sqpoll_m
+                 << " sqpoll_cpus=[" << cpus_str << "]"
+                 << " fixed_buffers=" << (fixed ? 1 : 0)
+                 << " buf_capacity=" << buf_cap << " slot_size=" << slot_sz;
+    }
 
     coro_net::TcpServer server(
         coro_net::InetAddress{port, "0.0.0.0"},
         static_cast<size_t>(nthr));
 
     server.set_sqpoll_threads(sqpoll_m);
+    server.set_sqpoll_cpus(poll_cpus);
     server.set_fixed_buffers(fixed, slot_sz, buf_cap);
 
     server.set_handler([](coro_net::TcpConnectionPtr conn)

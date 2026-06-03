@@ -72,7 +72,8 @@ void TcpServer::start() {
         use_fixed_buffers_
             ? (buf_pool_capacity_ ? buf_pool_capacity_ : kDefaultBufCapacity)
             : 0;
-    pool_ = std::make_unique<SchedulerPool>(worker_threads_, cfg, sqpoll_threads_);
+    pool_ = std::make_unique<SchedulerPool>(worker_threads_, cfg, sqpoll_threads_,
+                                            sqpoll_cpus_);
 
     const size_t n = pool_->size();
 

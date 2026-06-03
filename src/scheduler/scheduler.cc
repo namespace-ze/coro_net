@@ -71,6 +71,7 @@ Scheduler::Scheduler(SchedulerConfig cfg) {
     p.sqpoll            = cfg.sqpoll;
     p.sq_thread_idle_ms = cfg.sq_thread_idle_ms;
     p.wq_fd             = cfg.wq_fd;
+    p.sq_thread_cpu     = cfg.sq_thread_cpu;
     ring_ = std::make_unique<IoUring>(p);
     if (cfg.sqpoll && !ring_->sqpoll_active()) {
         LOG_WARN << "Scheduler@" << static_cast<const void*>(this)
